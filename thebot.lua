@@ -38,7 +38,7 @@ local localPlayer = players.LocalPlayer
 -- ============================================================
 local BOT_PROFILES = {
     ["wdadadwaddad0"] = { id = "98a5a262a479bd8203a8f5d9", secret = "3f0bf649661ee04db63e561fe0f4e5475e666cd73317df8e1ea892a0c69f0876" },
-    ["ps99_flipreal"] = { id = "2962708adcee6bc25b04df59", secret = "0d575beceae8e337201e2b18d17ce756d6cc0cc4ca8378eb92610a2dafc31a6a" },
+    ["ps99_flipreal"] = { id = "2962708adcee6bc25b04df59", secret = "0d575beceae8e337201e2b18d17ce756d6cc0cc4ca8370eb92610a2dafc31a6a" },
 }
 local myProfile = localPlayer and BOT_PROFILES[localPlayer.Name]
 if myProfile then
