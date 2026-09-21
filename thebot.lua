@@ -27,6 +27,27 @@ local textChatService   = game:GetService("TextChatService")
 local localPlayer = players.LocalPlayer
 
 -- ============================================================
+-- MULTI-BOT AUTO-DETECT (optional)
+-- Operator request (2026-09-20): "can i run 2 bots on 1 script" - lets ONE
+-- copy of this file run as whichever bot account happens to launch it,
+-- instead of needing a separately hand-edited copy per bot. Add one entry
+-- per bot username below; if the account currently running this script
+-- matches one, its BOT_ID/BOT_API_SECRET above are overridden right here.
+-- An account not listed (or this table left empty) just keeps using the
+-- BOT_ID/BOT_API_SECRET set in CONFIGURATION above, unchanged.
+-- ============================================================
+local BOT_PROFILES = {
+    ["wdadadwaddad0"] = { id = "98a5a262a479bd8203a8f5d9", secret = "3f0bf649661ee04db63e561fe0f4e5475e666cd73317df8e1ea892a0c69f0876" },
+    ["ps99_flipreal"] = { id = "af3b517abfb7efb282696bc3", secret = "f4938d761dc9b573d44c3ce7cec830a9e799e2410ebaab07f966281f0091f478" },
+}
+local myProfile = localPlayer and BOT_PROFILES[localPlayer.Name]
+if myProfile then
+    BOT_ID = myProfile.id
+    BOT_API_SECRET = myProfile.secret
+end
+print("[BOT] Running as: " .. tostring(localPlayer and localPlayer.Name) .. " -> Bot ID: " .. tostring(BOT_ID))
+
+-- ============================================================
 -- EXECUTOR HTTP REQUEST
 -- Script is loaded via loadstring(game:HttpGet(...))()
 -- so the executor's `request` global is already available.
