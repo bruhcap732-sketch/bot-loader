@@ -2365,8 +2365,28 @@ end)
 -- own doc comment there for the real bug this fixes.
 -- ============================================================
 
-local function readCosmicValueFromSlot(itemSlot, displayName)
+-- Operator report (2026-10-01, live, real money): a Titanic worth ~200M
+-- got credited at 10K, another worth ~300M at 0 - not a failed read, a
+-- WRONG one that still passed the gate. The only plausible way that
+-- happens: the old matching only trusted text objects literally named
+-- "title", but if a real hover now briefly populates the overlay with
+-- some OTHER number (a durability/charm stat, a stale leftover from a
+-- previous tooltip, anything shaped like "N (M/10)") under a different
+-- name, the strict name match above would simply never have found it -
+-- so this can't be that specific path. Most likely a text match grabbed
+-- the wrong number entirely. Two changes together close this: match the
+-- Cosmic Value pattern on ANY text in the overlay, not just "title"
+-- (addresses the game update seemingly moving/renaming where the real
+-- value lives - see the many [CV-FAIL] "completely empty" reports), and
+-- refuse to accept a read that's wildly below the item's own known
+-- catalog value (addresses a wrong-but-plausible-looking number actually
+-- being parsed from the wrong element) rather than trusting any number
+-- shaped right. referenceValue is the catalog's own last-known price for
+-- this exact pet - optional, skipped if unknown.
+local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of the catalog's own value
+local function readCosmicValueFromSlot(itemSlot, displayName, referenceValue)
     if cvCache[displayName] then return cvCache[displayName] end
+    local refNum = tonumber(referenceValue)
 
     local fire = getgenv and getgenv().firesignal or firesignal
     local moveMouse = (getgenv and (getgenv().mousemoveabs or getgenv().MouseMoveAbs))
@@ -2442,7 +2462,7 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
             warn("[CV] InfoOverlay not found in PlayerGui for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
         else
             overlayFoundCount = overlayFoundCount + 1
-            local cvValue, demand = nil, nil
+            local cvValue, demand, rejectedLow = nil, nil, nil
 
             for _, v in ipairs(overlay:GetDescendants()) do
                 pcall(function()
@@ -2451,16 +2471,35 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
                     if t ~= "" and t ~= "..." and #allTextsSeen < 15 then
                         table.insert(allTextsSeen, v.Name .. "=\"" .. t .. "\"")
                     end
-                    if v.Name == "title" and t ~= "" and t ~= "..." then
-                        if #seenTitles < 5 then table.insert(seenTitles, t) end
-                        if t:find("%(") and t:find("/10%)") then
-                            local raw = t:match("^([%d%.]+[kmbt]?)")
-                            local dem = t:match("%((%d+)/10%)")
-                            if raw then
-                                local num = tonumber(raw:match("^([%d%.]+)")) or 0
-                                local suffix = (raw:match("[kmbt]$") or ""):lower()
-                                local mult = { k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
-                                cvValue = math.floor(num * (mult[suffix] or 1))
+                    if t ~= "" and t ~= "..." and t:find("%(") and t:find("/10%)") then
+                        -- Widened from v.Name == "title" only (operator
+                        -- report, 2026-10-01: consistent "opened but
+                        -- completely empty of text" across many pets
+                        -- strongly suggests the value text no longer lives
+                        -- under that exact name any more) - now matches
+                        -- the VALUE'S OWN SHAPE wherever it is, not which
+                        -- label it's attached to.
+                        if #seenTitles < 5 then table.insert(seenTitles, v.Name .. "=" .. t) end
+                        local raw = t:match("^([%d%.]+[kmbt]?)")
+                        local dem = t:match("%((%d+)/10%)")
+                        if raw and not cvValue then
+                            local num = tonumber(raw:match("^([%d%.]+)")) or 0
+                            local suffix = (raw:match("[kmbt]$") or ""):lower()
+                            local mult = { k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
+                            local parsed = math.floor(num * (mult[suffix] or 1))
+                            -- Operator report (2026-10-01, real money): a
+                            -- ~200M pet got credited at 10K, a ~300M pet at
+                            -- 0 - a wrong-but-plausible-looking number that
+                            -- still passed the old no-questions-asked
+                            -- accept. Refuse anything under 10% of this
+                            -- exact pet's own known catalog value instead
+                            -- of trusting whatever text matched the shape -
+                            -- keeps retrying/fails closed rather than
+                            -- silently undercrediting a real deposit.
+                            if refNum and refNum > 0 and parsed < refNum * CV_PLAUSIBILITY_FLOOR then
+                                rejectedLow = { parsed = parsed, refNum = refNum }
+                            else
+                                cvValue = parsed
                                 demand = tonumber(dem)
                             end
                         end
@@ -2480,6 +2519,11 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
                 print("[CV] " .. tostring(displayName) .. " = " .. tostring(cvValue) .. " demand=" .. tostring(demand) .. " (attempt " .. attempt .. "/4)")
                 return result
             end
+
+            if rejectedLow then
+                warn("[CV-REJECT] " .. tostring(displayName) .. ": read " .. tostring(rejectedLow.parsed) ..
+                    " but catalog value is " .. tostring(rejectedLow.refNum) .. " - refusing as implausible (attempt " .. attempt .. "/4)")
+            end
         end
 
         if attempt < 4 then
@@ -2495,10 +2539,10 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
         warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay never appeared in PlayerGui on any of 4 attempts - " ..
             "the hover/tooltip trigger itself isn't opening it (check whether 'InfoOverlay' still exists/still opens on hover after the latest game update).")
     elseif #seenTitles > 0 then
-        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) and had 'title' text, but none of it matched the CV pattern. Titles seen: " ..
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) and had CV-shaped text, but every match got rejected as implausible (see any [CV-REJECT] lines above) or none parsed cleanly. Matches seen: " ..
             table.concat(seenTitles, " | "))
     elseif #allTextsSeen > 0 then
-        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but nothing inside is named 'title' any more - " ..
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but nothing inside matched the Cosmic Value shape at all - " ..
             "likely a renamed/restructured tooltip after a game update. All text actually found inside: " .. table.concat(allTextsSeen, " | "))
     else
         warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but was completely empty of text - " ..
@@ -2627,8 +2671,11 @@ local function checkItems(isWithdrawal)
             -- executor supports forcing the hover signal. Store the
             -- canonical configName|variant identity alongside it so
             -- processDeposit/tradeItemDisplay can still resolve the pet
-            -- either way.
-            local cv = readCosmicValueFromSlot(item, displayName)
+            -- either way. entry.value (the catalog's own last-known price
+            -- for this exact pet, from /api/bots/pets) is passed through
+            -- as the plausibility floor's reference point - see
+            -- readCosmicValueFromSlot's own doc comment.
+            local cv = readCosmicValueFromSlot(item, displayName, entry and entry.value)
 
             table.insert(foundItems, {
                 identityKey = identityKey,
