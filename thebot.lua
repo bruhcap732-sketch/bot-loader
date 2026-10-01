@@ -2386,7 +2386,23 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
     -- cursor moves before the tooltip's own handler notices and populates
     -- it, and 0.15s wasn't always enough. Retry a few times with a fresh
     -- move+fire each attempt before giving up.
+    -- Operator report (2026-10-01): "where it shows in the console exactly
+    -- where the problem went" - the old failure message only ever said
+    -- "InfoOverlay never populated a 'title' TextLabel/TextButton", which
+    -- is ambiguous between two very different failures: the InfoOverlay
+    -- object itself never showing up at all (overlayFoundCount stays 0 -
+    -- points at the hover/tooltip trigger itself being broken, e.g. after
+    -- a game update renamed or restructured it) versus InfoOverlay showing
+    -- up fine every time but nothing inside it named "title" ever matches
+    -- the Cosmic Value text pattern (points at PS99 having changed the
+    -- tooltip's internal layout/naming, not whether it opens at all).
+    -- allTextsSeen now also captures EVERY non-empty text object found
+    -- inside the overlay, not just ones named "title" - if the overlay is
+    -- opening but under a new structure, this prints its real current
+    -- contents instead of just "nothing matched."
     local seenTitles = {}
+    local allTextsSeen = {}
+    local overlayFoundCount = 0
     for attempt = 1, 4 do
         print("[CV] Attempting read for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
 
@@ -2425,12 +2441,16 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
         if not overlay then
             warn("[CV] InfoOverlay not found in PlayerGui for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
         else
+            overlayFoundCount = overlayFoundCount + 1
             local cvValue, demand = nil, nil
 
             for _, v in ipairs(overlay:GetDescendants()) do
                 pcall(function()
                     if not (v:IsA("TextLabel") or v:IsA("TextButton")) then return end
                     local t = tostring(v.Text or "")
+                    if t ~= "" and t ~= "..." and #allTextsSeen < 15 then
+                        table.insert(allTextsSeen, v.Name .. "=\"" .. t .. "\"")
+                    end
                     if v.Name == "title" and t ~= "" and t ~= "..." then
                         if #seenTitles < 5 then table.insert(seenTitles, t) end
                         if t:find("%(") and t:find("/10%)") then
@@ -2471,10 +2491,18 @@ local function readCosmicValueFromSlot(itemSlot, displayName)
         pcall(function() fire(itemSlot.MouseLeave, 0, 0) end)
     end
 
-    if #seenTitles > 0 then
-        warn("[CV] Gave up on " .. tostring(displayName) .. " after 4 attempts - InfoOverlay opened but no title ever matched the CV pattern. Titles seen: " .. table.concat(seenTitles, " | "))
+    if overlayFoundCount == 0 then
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay never appeared in PlayerGui on any of 4 attempts - " ..
+            "the hover/tooltip trigger itself isn't opening it (check whether 'InfoOverlay' still exists/still opens on hover after the latest game update).")
+    elseif #seenTitles > 0 then
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) and had 'title' text, but none of it matched the CV pattern. Titles seen: " ..
+            table.concat(seenTitles, " | "))
+    elseif #allTextsSeen > 0 then
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but nothing inside is named 'title' any more - " ..
+            "likely a renamed/restructured tooltip after a game update. All text actually found inside: " .. table.concat(allTextsSeen, " | "))
     else
-        warn("[CV] Gave up on " .. tostring(displayName) .. " after 4 attempts - InfoOverlay never populated a 'title' TextLabel/TextButton")
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but was completely empty of text - " ..
+            "it may need more time to populate, or render a different way now (e.g. ViewportFrame/Image instead of text).")
     end
 
     return nil
@@ -3715,9 +3743,15 @@ local function handleTradeCompletion(tradeMethod)
         print("[COMPLETE] Processing deposit: " .. #lastTradeItems .. " pets, " .. lastTradeGems .. " gems (bypassMin=" .. tostring(bypassMin) .. ")")
         local success, result = processDeposit(lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, bypassMin)
         if success then
+            -- Operator report (2026-10-01): "make the bot stop typing in
+            -- the chat" - traced to Roblox's own anti-link filter turning
+            -- any chat message containing "bloxyflip.fun" into a wall of
+            -- #### for most recipients (it reads as a URL). Dropped the
+            -- domain mention entirely rather than reword it - any
+            -- "x.fun"-shaped text risks the same filtering, and the
+            -- balance/item confirmation itself still comes through clean.
             sendMessage("Deposited " .. tostring(result) .. " items!")
             if lastTradeGems > 0 then sendMessage("Plus " .. formatDepositGemCredit(lastTradeGems) .. "!") end
-            sendMessage("Check bloxyflip.fun!")
             local itemList = ""
             for i, item in ipairs(lastTradeItems) do
                 if i <= 10 then
@@ -4003,7 +4037,7 @@ local function handleTradeCompletion(tradeMethod)
                         "\n**Pets sent:** " .. petCount .. "\n**Gems sent:** " .. gemsActuallySent ..
                         missingStr .. "\n\n" .. itemList, 16776960)
                 else
-                    sendMessage("Withdrawal complete! Check bloxyflip.fun")
+                    sendMessage("Withdrawal complete!")
                     sendDiscord("**WITHDRAWAL COMPLETED**\n**Player:** " .. tostring(lastTradeUsername) ..
                         "\n**Pets sent:** " .. petCount .. "\n**Gems sent:** " .. gemsActuallySent ..
                         "\n\n" .. itemList, 65280)
