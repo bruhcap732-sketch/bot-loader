@@ -14,6 +14,13 @@ local website          = "https://bloxyflip.fun"
 local discordWebhook   = ""  -- optional: Discord webhook for trade logs
 
 local TRADE_TIMEOUT_SECONDS = 120
+-- A trade the bot already accepted but where the player never even clicks
+-- READY blocks every OTHER incoming trade for the full TRADE_TIMEOUT_SECONDS,
+-- since nothing short-circuits it earlier. Cancel much sooner in that
+-- specific case only - a trade that's actually in progress (player already
+-- readied at least once) is untouched and still protected by the full
+-- TRADE_TIMEOUT_SECONDS safety net.
+local NOT_READIED_TIMEOUT_SECONDS = 35
 local MAX_TRADE_PETS = 100
 local ROBLOX_GEMS_PER_SITE_GEM = 1 -- 1m Roblox gems = 1 site gem; 1b = 1000
 -- ============================================================
@@ -36,10 +43,7 @@ local localPlayer = players.LocalPlayer
 -- An account not listed (or this table left empty) just keeps using the
 -- BOT_ID/BOT_API_SECRET set in CONFIGURATION above, unchanged.
 -- ============================================================
-local BOT_PROFILES = {
-    ["wdadadwaddad0"] = { id = "98a5a262a479bd8203a8f5d9", secret = "3f0bf649661ee04db63e561fe0f4e5475e666cd73317df8e1ea892a0c69f0876" },
-    ["ps99_flipreal"] = { id = "2962708adcee6bc25b04df59", secret = "0d575beceae8e337201e2b18d17ce756d6cc0cc4ca8370eb92610a2dafc31a6a" },
-}
+local BOT_PROFILES = {}
 local myProfile = localPlayer and BOT_PROFILES[localPlayer.Name]
 if myProfile then
     BOT_ID = myProfile.id
@@ -258,6 +262,11 @@ local activeIncomingTrade = false
 local activeIncomingUserId = nil
 local activeIncomingSince = 0
 local withdrawalHoldUntil = {}
+-- Throttles the repeated-request log/decline below to once a second per
+-- user instead of once per loop tick (every 0.05s) - the main loop was
+-- printing and re-declining the same held request ~20x/second for the
+-- entire cooldown window, flooding the console log.
+local lastHoldDeclineAt = {}
 local WITHDRAWAL_HOLD_COOLDOWN = 30
 local method             = nil
 local tradeId            = 0
@@ -2384,9 +2393,25 @@ end)
 -- shaped right. referenceValue is the catalog's own last-known price for
 -- this exact pet - optional, skipped if unknown.
 local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of the catalog's own value
+-- Operator-verified pattern (2026-10-01, live): in a 5-pet trade, the FIRST
+-- item read its Cosmic Value correctly on the very first attempt, and
+-- every item after it failed "opened but completely empty of text" - 4/4
+-- attempts, all four of them. That's not random flakiness (which would hit
+-- some middling fraction of attempts across all items), it's "whichever
+-- item happens first in the loop works, everything immediately after it
+-- doesn't" - consistent with PS99's tooltip needing a beat to actually
+-- close out after one hover before it'll properly reopen for the next, and
+-- this bot moving to the next slot's hover with no gap at all right behind
+-- the previous one's MouseLeave. A short settle wait before every item's
+-- FIRST attempt (not just between retries of the same item, which already
+-- existed) costs almost nothing on a successful read and may be exactly
+-- what the next slot needs to not inherit the previous tooltip's stuck
+-- state.
+local CV_INTER_ITEM_SETTLE_SECONDS = 0.25
 local function readCosmicValueFromSlot(itemSlot, displayName, referenceValue)
     if cvCache[displayName] then return cvCache[displayName] end
     local refNum = tonumber(referenceValue)
+    task.wait(CV_INTER_ITEM_SETTLE_SECONDS)
 
     local fire = getgenv and getgenv().firesignal or firesignal
     local moveMouse = (getgenv and (getgenv().mousemoveabs or getgenv().MouseMoveAbs))
@@ -5171,7 +5196,24 @@ task.spawn(function()
             continue
         end
 
-        local trade = incoming[1]
+        -- Do not blindly process incoming[1]. GetAllRequests() has no
+        -- guaranteed order, and if whoever lands in slot 1 is an
+        -- unrecognized/unresolved request (e.g. a Roblox account with no
+        -- linked BloxyFlip account) that stays open in Roblox, it can keep
+        -- re-landing in slot 1 on every scan - jamming every real trade
+        -- behind it for as long as that one person leaves their window
+        -- open. Prefer the first request that is NOT currently on cooldown
+        -- so one unresolved/ignored user can never block everyone else.
+        local trade = nil
+        for _, candidate in ipairs(incoming) do
+            local candidateHold = tonumber(withdrawalHoldUntil[tostring(candidate.UserId)]) or 0
+            if candidateHold <= tick() then
+                trade = candidate
+                break
+            end
+        end
+        trade = trade or incoming[1]
+
         local username = trade.Name
         local userId = tostring(trade.UserId)
 
@@ -5181,14 +5223,18 @@ task.spawn(function()
         -- that already-declined request.
         local holdUntil = tonumber(withdrawalHoldUntil[userId]) or 0
         if holdUntil > tick() then
-            print("[TRADE] Ignoring repeated blocked-withdrawal request | user=" ..
-                tostring(username) .. " | cooldown=" ..
-                string.format("%.1fs", holdUntil - tick()))
-            pcall(function()
-                if type(tradingCommands.DeclineRequest) == "function" then
-                    tradingCommands.DeclineRequest(trade)
-                end
-            end)
+            local lastDecline = tonumber(lastHoldDeclineAt[userId]) or 0
+            if tick() - lastDecline >= 1 then
+                lastHoldDeclineAt[userId] = tick()
+                print("[TRADE] Ignoring repeated blocked-withdrawal request | user=" ..
+                    tostring(username) .. " | cooldown=" ..
+                    string.format("%.1fs", holdUntil - tick()))
+                pcall(function()
+                    if type(tradingCommands.DeclineRequest) == "function" then
+                        tradingCommands.DeclineRequest(trade)
+                    end
+                end)
+            end
             continue
         else
             withdrawalHoldUntil[userId] = nil
@@ -5826,6 +5872,45 @@ task.spawn(function()
             end
         end)
 
+        -- ====================================================
+        -- NOT-READIED WATCHDOG (see NOT_READIED_TIMEOUT_SECONDS above)
+        -- ====================================================
+        task.spawn(function()
+            task.wait(NOT_READIED_TIMEOUT_SECONDS)
+
+            if not goNext
+                and tradeId == localId
+                and not hasReadied
+                and isInTrade()
+            then
+                sendMessage(
+                    "No response - cancelling so other trades aren't blocked. Please re-trade."
+                )
+
+                cancelWithdrawalTrade(
+                    withdrawalData.data,
+                    "Never readied",
+                    true
+                )
+
+                sendDiscord(
+                    "Withdrawal never readied, auto-cancelled: " ..
+                    username,
+                    16776960
+                )
+
+                declineTrade()
+
+                goNext = true
+                tradeId = 0
+                lastGameTradeId = nil
+                method = nil
+                releaseIncomingTradeLock()
+                resetTradeState()
+                print("[TRADE] Not-readied watchdog cleanup complete - ready for next trade")
+            end
+        end)
+
     else
         cancelWithdrawalTrade(
             withdrawalData.data,
@@ -5894,6 +5979,36 @@ task.spawn(function()
                         releaseIncomingTradeLock()
                         resetTradeState()
                         print("[TRADE] Deposit timeout cleanup complete - ready for next trade")
+                    end
+                end)
+
+                -- ====================================================
+                -- NOT-READIED WATCHDOG (see NOT_READIED_TIMEOUT_SECONDS above)
+                -- ====================================================
+                task.spawn(function()
+                    task.wait(NOT_READIED_TIMEOUT_SECONDS)
+
+                    if not goNext
+                        and tradeId == localId
+                        and not hasReadied
+                        and isInTrade()
+                    then
+                        sendMessage("No response - cancelling so other trades aren't blocked. Please re-trade.")
+
+                        sendDiscord(
+                            "Deposit never readied, auto-cancelled: " .. username,
+                            16776960
+                        )
+
+                        declineTrade()
+
+                        goNext = true
+                        tradeId = 0
+                        lastGameTradeId = nil
+                        method = nil
+                        releaseIncomingTradeLock()
+                        resetTradeState()
+                        print("[TRADE] Not-readied watchdog cleanup complete - ready for next trade")
                     end
                 end)
 
