@@ -998,21 +998,13 @@ end
 -- ============================================================
 -- CHAT & DISCORD
 -- ============================================================
-local function sendMessage(message)
-    humanDelay(200, 500)
-    local sent = false
-    pcall(function()
-        local ch = textChatService.TextChannels and textChatService.TextChannels:FindFirstChild("RBXGeneral")
-        if ch then ch:SendAsync(tostring(message)); sent = true end
-    end)
-    if not sent then
-        pcall(function()
-            game:GetService("ReplicatedStorage")
-                :FindFirstChild("DefaultChatSystemChatEvents")
-                :FindFirstChild("SayMessageRequest")
-                :FireServer(tostring(message), "All")
-        end)
-    end
+-- Operator request (speed over in-trade chat): every call used to block the
+-- trade loop for 200-500ms (humanDelay) before sending a Roblox chat line
+-- players never needed to act on - every call site already has its own
+-- real signal (the site UI, Discord logs via sendDiscord below) independent
+-- of this text. Left as a no-op stub, not deleted, so every existing call
+-- site still compiles unchanged - only the blocking chat send goes away.
+local function sendMessage(_message)
 end
 
 local function sendDiscord(message, color)
@@ -4494,6 +4486,36 @@ local function connectStatus(localId, tradeMethod)
                 elseif tradeMethod == "withdraw" then
                     local hasError, output = checkItems(true)
 
+                    -- Operator request (2026-10-09): flatly reject a trade
+                    -- that mixes a deposit into an active withdrawal
+                    -- payout, instead of trying to handle both in one
+                    -- trade. This is the combined withdraw+deposit feature
+                    -- disabled outright - a blunt, deliberate safety call
+                    -- around exactly the "add a different pet while the
+                    -- bot is mid-payout" shape the operator was worried
+                    -- about, even though no actual hole was ever confirmed
+                    -- in this path's own logic. The withdrawal itself
+                    -- isn't cancelled - just this trade, so a clean retry
+                    -- (payout only, nothing added) goes through fine.
+                    if not hasError and #output > 0 then
+                        warn("[WITHDRAW-GUARD] Player added item(s) during a withdrawal payout - rejecting the trade")
+                        sendMessage("Withdrawals can't include extra items right now - remove them and trade again for just your withdrawal.")
+                        pcall(function() tradingCommands.SetReady(false) end)
+                        declineTrade()
+                        sendDiscord(
+                            "🚫 **WITHDRAW+DEPOSIT REJECTED**\n**Player:** " .. tostring(lastTradeUsername) ..
+                            "\nTried to add " .. #output .. " item(s) during a withdrawal payout - trade declined, withdrawal left pending.",
+                            16776960
+                        )
+                        goNext = true
+                        tradeId = 0
+                        lastGameTradeId = nil
+                        method = nil
+                        releaseIncomingTradeLock()
+                        resetTradeState()
+                        continue
+                    end
+
                     -- Real gap fix (2026-09-20): a player depositing a pet
                     -- ALONGSIDE a withdrawal (this branch) never got the
                     -- same Cosmic Value / gems-read gate the plain deposit
@@ -5133,9 +5155,28 @@ end)
 -- ============================================================
 -- TRADE ID TRACKER
 -- ============================================================
+-- Real bug: this used to overwrite the shared `tradeId` every 0.1s
+-- completely independently of the main trade loop. The entire trade state
+-- machine (every `tradeId == localId` / `tradeId ~= localId` checkpoint
+-- below) depends on `tradeId` staying authoritative and only changing when
+-- the main loop itself changes it - it snapshots `tradeId` into `localId`
+-- once at the start of handling a claimed trade, then re-checks that
+-- snapshot at each step to make sure it's still safely working on that same
+-- trade. A second trade event landing mid-negotiation (e.g. a deposit
+-- offered while the bot is still mid-payout on a withdrawal) can shift
+-- Roblox's own live trade id, and this tracker would stomp the shared
+-- variable out from under the main loop with no coordination at all -
+-- tripping or silently defeating those checks and corrupting which trade's
+-- state the bot thinks it's acting on. Gated on `activeIncomingTrade` (the
+-- same lock the main loop sets the instant it claims a trade and clears via
+-- releaseIncomingTradeLock() at every exit) so this only ever refreshes
+-- `tradeId` while no trade is actively being processed - once the main loop
+-- owns a trade, it owns `tradeId` exclusively until it releases the lock.
 task.spawn(function()
     while task.wait(0.1) do
-        tradeId = getTradeId()
+        if not activeIncomingTrade then
+            tradeId = getTradeId()
+        end
     end
 end)
 
