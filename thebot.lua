@@ -2399,7 +2399,15 @@ local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of the cat
 -- existed) costs almost nothing on a successful read and may be exactly
 -- what the next slot needs to not inherit the previous tooltip's stuck
 -- state.
-local CV_INTER_ITEM_SETTLE_SECONDS = 0.25
+-- Trimmed 2026-10-10 (operator report: visible mouse-jump/lag on every
+-- deposit, "only happens when I deposit") - 0.25 -> 0.12. This read
+-- genuinely does move the real system cursor and force hover events per
+-- item, which is the actual source of that lag, not a performance
+-- problem on the player's own end. Cut the settle gap, not the retry
+-- COUNT below (still 4 attempts) - reliability comes from retrying, not
+-- from how long any single wait is, so this trims real time off a normal
+-- deposit without meaningfully raising the odds of a failed read.
+local CV_INTER_ITEM_SETTLE_SECONDS = 0.12
 local function readCosmicValueFromSlot(itemSlot, displayName, referenceValue)
     if cvCache[displayName] then return cvCache[displayName] end
     local refNum = tonumber(referenceValue)
@@ -2472,7 +2480,10 @@ local function readCosmicValueFromSlot(itemSlot, displayName, referenceValue)
         -- Give PS99's tooltip handler a moment to populate InfoOverlay -
         -- a real cursor move + engine hover detection needs at least a
         -- frame or two to register, not just an instantly-fired event.
-        task.wait(0.15)
+        -- Trimmed 0.15 -> 0.12 alongside CV_INTER_ITEM_SETTLE_SECONDS
+        -- above, same reasoning - still 4 full attempts if this one's
+        -- too short, so reliability isn't riding on this single number.
+        task.wait(0.12)
 
         local overlay = playerGUI:FindFirstChild("InfoOverlay")
         if not overlay then
@@ -3501,15 +3512,34 @@ local function addWithdrawalItems(withdrawalData, dryRun)
 
             local found = false
             local matchingCandidatesTried = 0
+            local MAX_MATCHING_CANDIDATES_PER_REQUEST = 2
 
-            -- Compact diagnostic for the requested identity; no full inventory spam.
-            local debugMatches = 0
+            -- Real perf fix (2026-10-10, operator report: "the bot was
+            -- laggy... that's why it couldn't withdraw"): this used to scan
+            -- the ENTIRE botHuges list TWICE per requested item - once just
+            -- to print a diagnostic match count, once for the real
+            -- selection - with petMatches() doing string normalization
+            -- (lower/gsub) on every single comparison either way. With a
+            -- bot inventory in the hundreds/thousands (exactly what builds
+            -- up over a long session of real deposits) and a withdrawal
+            -- requesting several items, that's the full list re-walked
+            -- twice per item - real, compounding cost, not imagined. One
+            -- pass now, capped at 10 collected candidates (comfortably
+            -- more than the 2 this ever actually tries, plus the 3 the
+            -- diagnostic print shows) - the match COUNT keeps counting
+            -- past the cap for accurate logging, it just stops allocating
+            -- more candidate entries once there's no real use for more.
+            local matches = {}
+            local matchCount = 0
             for _, dbgPet in ipairs(botHuges) do
-                if petMatches(dbgPet, req, displayName, requestedVariant) then
-                    debugMatches = debugMatches + 1
-                    if debugMatches <= 3 then
+                if not usedUUIDs[dbgPet.uuid] and petMatches(dbgPet, req, displayName, requestedVariant) then
+                    matchCount = matchCount + 1
+                    if matchCount <= 10 then
+                        table.insert(matches, dbgPet)
+                    end
+                    if matchCount <= 3 then
                         print("[WITHDRAWAL-DIAG] MATCHABLE INVENTORY PET #" ..
-                            tostring(debugMatches) ..
+                            tostring(matchCount) ..
                             " | name=" .. tostring(dbgPet.name or getNameById(dbgPet.id)) ..
                             " | id=" .. tostring(dbgPet.id) ..
                             " | variant=" .. tostring(dbgPet.variant) ..
@@ -3520,18 +3550,10 @@ local function addWithdrawalItems(withdrawalData, dryRun)
             end
             print("[WITHDRAWAL-DIAG] Requested '" .. tostring(displayName) ..
                 "' | variant=" .. tostring(requestedVariant) ..
-                " | matchableCount=" .. tostring(debugMatches))
-            local MAX_MATCHING_CANDIDATES_PER_REQUEST = 2
+                " | matchableCount=" .. tostring(matchCount))
 
-            for _, b in ipairs(botHuges) do
-                if not usedUUIDs[b.uuid]
-                    and petMatches(
-                        b,
-                        req,
-                        displayName,
-                        requestedVariant
-                    )
-                then
+            for _, b in ipairs(matches) do
+                do
                     matchingCandidatesTried = matchingCandidatesTried + 1
 
                     -- If SetItem itself is failing, trying every duplicate UUID
@@ -4486,25 +4508,43 @@ local function connectStatus(localId, tradeMethod)
                 elseif tradeMethod == "withdraw" then
                     local hasError, output = checkItems(true)
 
+                    -- Real gap fix (2026-10-09, operator report/screenshot:
+                    -- a player had 100,000,000 gems typed into their offer
+                    -- during a withdrawal payout and the bot did not reject
+                    -- it): the rejection below used to only ever check
+                    -- `output` (pets) for whether the player added
+                    -- anything - it never looked at gems at all, and gems
+                    -- weren't even read yet at this point in the code. A
+                    -- player adding GEMS instead of a pet during a
+                    -- withdrawal sailed straight past the guard this was
+                    -- supposed to be. Gems are now read right here,
+                    -- unconditionally, so both are known before deciding
+                    -- whether to reject.
+                    local addedGems, addedGemsReadOk = 0, true
+                    if not hasError then
+                        addedGems, addedGemsReadOk = client_trade_gems()
+                    end
+
                     -- Operator request (2026-10-09): flatly reject a trade
-                    -- that mixes a deposit into an active withdrawal
-                    -- payout, instead of trying to handle both in one
-                    -- trade. This is the combined withdraw+deposit feature
-                    -- disabled outright - a blunt, deliberate safety call
-                    -- around exactly the "add a different pet while the
-                    -- bot is mid-payout" shape the operator was worried
-                    -- about, even though no actual hole was ever confirmed
-                    -- in this path's own logic. The withdrawal itself
-                    -- isn't cancelled - just this trade, so a clean retry
-                    -- (payout only, nothing added) goes through fine.
-                    if not hasError and #output > 0 then
-                        warn("[WITHDRAW-GUARD] Player added item(s) during a withdrawal payout - rejecting the trade")
-                        sendMessage("Withdrawals can't include extra items right now - remove them and trade again for just your withdrawal.")
+                    -- that mixes a deposit - pets OR gems - into an active
+                    -- withdrawal payout, instead of trying to handle both
+                    -- in one trade. This is the combined withdraw+deposit
+                    -- feature disabled outright - a blunt, deliberate
+                    -- safety call around exactly the "add something while
+                    -- the bot is mid-payout" shape the operator was
+                    -- worried about, even though no actual hole was ever
+                    -- confirmed in this path's own logic. The withdrawal
+                    -- itself isn't cancelled - just this trade, so a clean
+                    -- retry (payout only, nothing added) goes through fine.
+                    if not hasError and (#output > 0 or (addedGemsReadOk and addedGems > 0)) then
+                        warn("[WITHDRAW-GUARD] Player added item(s)/gems during a withdrawal payout - rejecting the trade")
+                        sendMessage("Withdrawals can't include extra items or gems right now - remove them and trade again for just your withdrawal.")
                         pcall(function() tradingCommands.SetReady(false) end)
                         declineTrade()
                         sendDiscord(
                             "🚫 **WITHDRAW+DEPOSIT REJECTED**\n**Player:** " .. tostring(lastTradeUsername) ..
-                            "\nTried to add " .. #output .. " item(s) during a withdrawal payout - trade declined, withdrawal left pending.",
+                            "\nTried to add " .. #output .. " item(s) and " .. tostring(addedGems) ..
+                            " gems during a withdrawal payout - trade declined, withdrawal left pending.",
                             16776960
                         )
                         goNext = true
@@ -5172,9 +5212,24 @@ end)
 -- releaseIncomingTradeLock() at every exit) so this only ever refreshes
 -- `tradeId` while no trade is actively being processed - once the main loop
 -- owns a trade, it owns `tradeId` exclusively until it releases the lock.
+-- Safety net added 2026-10-09 (operator report: "bot stopped working"
+-- after a run of deposits): if activeIncomingTrade ever gets stuck true
+-- (any code path that claims the lock without releasing it on every exit
+-- - a pre-existing risk this tracker's own gate above didn't create, but
+-- did stop silently masking, since the old unconditional version kept
+-- tradeId moving no matter what). TRADE_LOCK_STALE_FALLBACK_SECONDS is
+-- longer than the TRADE LOCK WATCHDOG's own 90s threshold (further below)
+-- so that watchdog gets the first, clean chance to actually release the
+-- lock properly - this is strictly the last-resort backstop if that ALSO
+-- somehow doesn't fire, so the bot can never again freeze accepting new
+-- trades for longer than this, full stop.
+local TRADE_LOCK_STALE_FALLBACK_SECONDS = 100
 task.spawn(function()
     while task.wait(0.1) do
-        if not activeIncomingTrade then
+        local lockStale = activeIncomingTrade
+            and activeIncomingSince > 0
+            and (tick() - activeIncomingSince) >= TRADE_LOCK_STALE_FALLBACK_SECONDS
+        if not activeIncomingTrade or lockStale then
             tradeId = getTradeId()
         end
     end
@@ -5205,6 +5260,50 @@ task.spawn(function()
                 16776960
             )
 
+            goNext = true
+            tradeId = 0
+            lastGameTradeId = nil
+            method = nil
+            releaseIncomingTradeLock()
+            resetTradeState()
+        end
+
+        -- Hard backstop added 2026-10-09 (operator report: the bot stopped
+        -- accepting new trades after a run of deposits, and did not
+        -- recover). The check above only ever fires while `not isInTrade()`
+        -- - deliberately conservative so it never interrupts a trade
+        -- that's genuinely still open and in progress. But that same
+        -- carefulness means if some OTHER code path ever claims the lock,
+        -- hits an error partway through (crashes out of a task.spawn
+        -- without reaching any of its own cleanup/release calls), and
+        -- leaves a real Roblox trade window open with nobody driving it,
+        -- isInTrade() stays true forever and the gentler check above can
+        -- never satisfy its own condition - the bot would then refuse
+        -- every future trade indefinitely, exactly what got reported.
+        -- After a much longer wait (5 minutes - long enough that this
+        -- never fires over a trade anyone could still be legitimately
+        -- negotiating), force the lock closed regardless of isInTrade(),
+        -- actively trying to decline/close whatever window might still be
+        -- open. Abandoning one genuinely-stuck trade is a far smaller cost
+        -- than silently refusing every trade after it for the rest of the
+        -- bot's uptime.
+        if activeIncomingTrade
+            and activeIncomingSince > 0
+            and (tick() - activeIncomingSince) >= 300
+        then
+            warn("[TRADE-WATCHDOG] HARD BACKSTOP: incoming-trade lock stuck 5+ minutes even with a trade window open - forcing it closed")
+            sendDiscord(
+                "🚨 **TRADE LOCK HARD RESET**\n" ..
+                "The incoming-trade lock was stuck for 5+ minutes, including while a Roblox trade window " ..
+                "appeared to still be open - something likely crashed mid-trade without cleaning up. " ..
+                "Forcing the lock closed and declining/closing whatever trade may still be open so the bot " ..
+                "can accept new trades again. Check the account manually for a stuck Roblox trade window.",
+                16711680
+            )
+
+            declineTrade()
+            tradeCancelled = true
+            tradeProcessed = true
             goNext = true
             tradeId = 0
             lastGameTradeId = nil
