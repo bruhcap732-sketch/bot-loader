@@ -2825,7 +2825,16 @@ local function withdrawalPetVariant(pet)
         end
     end
 
-    local shiny = withdrawalReadField(pet, "shiny", "isShiny")
+    -- Real bug fix (2026-10-10, confirmed via live [SHINY-PROBE] dump):
+    -- PS99's actual save record uses the field `sh` for shiny, not `shiny`
+    -- or `isShiny` - a real owned pet's raw table was `{ id = "Huge
+    -- Fireball Cat", sh = true, _uq = <table> }`, nothing named `shiny` or
+    -- `isShiny` anywhere on it. Every plain-Shiny (non-golden, non-rainbow)
+    -- pet was therefore silently unmatchable in every withdrawal, forever
+    -- - this is the actual fix, `sh` checked first since it's the real
+    -- field; `shiny`/`isShiny` kept as harmless fallbacks in case a
+    -- different save shape ever uses them instead.
+    local shiny = withdrawalReadField(pet, "sh", "shiny", "isShiny")
     local shinyBool = shiny == true
         or tonumber(shiny) == 1
         or (type(shiny) == "string" and shiny:lower() == "true")
@@ -4405,6 +4414,26 @@ local function connectStatus(localId, tradeMethod)
         local notReadyCount = 0
         local READY_LOSS_THRESHOLD = 4
 
+        -- Real bug fix (2026-10-10, live operator report: a deposit that
+        -- was fully validated AND confirmed ("[CONFIRM-CHECK] User side
+        -- verified", "marking confirmed anyway") got declined seconds
+        -- later by this bot itself - "[STATUS] Deposit: user unreadied
+        -- after confirm was fired - declining to prevent swap abuse" -
+        -- even though nothing was actually swapped. "it detects it in
+        -- console, it's just not updating the site" was this: the trade
+        -- never failed, our own bot cancelled a good one. The post-confirm
+        -- un-ready check below used a single isPlayerReady() read with NO
+        -- debounce at all, unlike the identical-purpose pre-confirm check
+        -- just above (which already requires READY_LOSS_THRESHOLD
+        -- consecutive false reads before acting, specifically because
+        -- isPlayerReady() is a flaky multi-fallback heuristic across
+        -- GetState/UI that can glitch for a tick, especially right as
+        -- SetConfirmed() is landing - see this trade's own "[CONFIRM]
+        -- Could not verify via GetState" line right before it). One flaky
+        -- tick was enough to wrongly cancel a real deposit. Same debounce
+        -- pattern, applied here too.
+        local postConfirmNotReadyCount = 0
+
         -- Once validation starts, do not run it again until we have observed a
         -- genuine un-ready state. This prevents the repeated checkItems() loop.
         local validationRunning = false
@@ -4707,23 +4736,32 @@ local function connectStatus(localId, tradeMethod)
             -- Unready after confirm fired: only cancel for DEPOSIT trades and only
             -- if the trade hasn't already completed (tradeProcessed guards against
             -- the trade window closing normally which also looks like an unready).
-            -- IMPORTANT: wait 1s grace period before cancelling — the success MSG
-            -- handler runs concurrently and may have already set tradeProcessed=true.
+            -- See postConfirmNotReadyCount's own doc comment above for why this
+            -- now requires several consecutive false reads, not just one, before
+            -- acting - same debounce the pre-confirm un-ready check already uses.
             if wasReady and not nowReady and confirmFired and tradeMethod == "deposit" and not tradeProcessed and not tradeCancelled then
-                task.wait(1)
-                if tradeProcessed or tradeCancelled then
-                    print("[STATUS] Trade already completed during grace period - skipping cancel")
+                postConfirmNotReadyCount = postConfirmNotReadyCount + 1
+
+                if postConfirmNotReadyCount >= READY_LOSS_THRESHOLD then
+                    -- IMPORTANT: wait 1s grace period before cancelling — the success MSG
+                    -- handler runs concurrently and may have already set tradeProcessed=true.
+                    task.wait(1)
+                    if tradeProcessed or tradeCancelled then
+                        print("[STATUS] Trade already completed during grace period - skipping cancel")
+                        return
+                    end
+                    warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
+                    sendMessage("Trade items changed - cancelling for safety!")
+                    tradeCancelled = true
+                    tradeProcessed = true
+                    declineTrade()
+                    goNext = true
+                    releaseIncomingTradeLock()
+                    resetTradeState()
                     return
                 end
-                warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
-                sendMessage("Trade items changed - cancelling for safety!")
-                tradeCancelled = true
-                tradeProcessed = true
-                declineTrade()
-                goNext = true
-                releaseIncomingTradeLock()
-                resetTradeState()
-                return
+            else
+                postConfirmNotReadyCount = 0
             end
 
             if not isInTrade() then break end
