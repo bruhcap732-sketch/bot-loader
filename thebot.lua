@@ -4,6 +4,65 @@
 -- Loaded via: loadstring(game:HttpGet("..."))()
 
 -- ============================================================
+-- SINGLE-INSTANCE GUARD
+-- ============================================================
+-- Real bug found live (2026-10-10, operator report: "it worked the first
+-- time, then it just breaks" - a deposit/withdrawal would succeed once,
+-- then subsequent trades misbehaved). The actual evidence was sitting in
+-- the operator's own console pastes the whole time: lines like
+-- "[TRADE] Incoming from: Jejd544" were printing TWICE, with two
+-- different nonces, for the exact same event - same for [GEM-BALANCE],
+-- [ANTI-AFK] Found hoverboard button, etc. That is not a console/display
+-- glitch. It means this script was running TWICE AT ONCE under the same
+-- bot account (executed twice, auto-execute plus a manual re-run, two
+-- windows, whatever the cause) - two completely independent copies, each
+-- with its own separate activeIncomingTrade/goNext locks (those are plain
+-- Lua locals, so they cannot coordinate across two separate script runs),
+-- both calling SetReady/SetItem/SetConfirmed against the SAME single real
+-- Roblox trade window and stepping on each other. The first trade can
+-- survive this by luck (the backend's own idempotency on process-deposit
+-- absorbed one real duplicate-call case already seen live), but nothing
+-- protects a later trade from the two copies actively fighting over it.
+--
+-- getgenv() (or _G as a fallback) is an executor-provided table that
+-- persists across separate loadstring() calls within the same Roblox
+-- client session - exactly the shared state needed to detect "is a
+-- previous copy of me still alive" from a second, independent execution
+-- that otherwise has no way to know the first one exists. If a live copy
+-- is already running, this one aborts immediately, before touching
+-- ANYTHING else (GUI, trade state, API calls) - so re-running the
+-- loadstring (on purpose or by accident) is now always safe: at most one
+-- copy ever actually drives trades.
+do
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    local GUARD_KEY = "__BLOXYFLIP_BOT_INSTANCE_ACTIVE"
+    local HEARTBEAT_KEY = "__BLOXYFLIP_BOT_INSTANCE_HEARTBEAT"
+    -- A guard set by a PAST session that crashed/stopped without clearing
+    -- it (executor reset, game left and rejoined without a fresh client,
+    -- etc.) should not permanently lock every future run out. The still-
+    -- running instance refreshes HEARTBEAT_KEY continuously (see the
+    -- task.spawn below); treat anything older than 20s as abandoned rather
+    -- than genuinely active.
+    local STALE_SECONDS = 20
+    local now = (type(os) == "table" and os.clock) and os.clock() or tick()
+    local lastHeartbeat = tonumber(env[HEARTBEAT_KEY])
+
+    if env[GUARD_KEY] == true and lastHeartbeat and (now - lastHeartbeat) < STALE_SECONDS then
+        warn("[BOT] ANOTHER COPY OF THIS SCRIPT IS ALREADY RUNNING in this Roblox session - aborting this one so they cannot fight over the same trade window. If the other copy is actually gone, wait 20s and try again.")
+        return
+    end
+
+    env[GUARD_KEY] = true
+    env[HEARTBEAT_KEY] = now
+    task.spawn(function()
+        while true do
+            task.wait(5)
+            env[HEARTBEAT_KEY] = (type(os) == "table" and os.clock) and os.clock() or tick()
+        end
+    end)
+end
+
+-- ============================================================
 -- CONFIGURATION (UPDATE THESE!)
 -- ============================================================
 local BOT_ID           = "98a5a262a479bd8203a8f5d9"   
