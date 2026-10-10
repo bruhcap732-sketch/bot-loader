@@ -1401,22 +1401,31 @@ local function readyTrade()
 
     print("[READY] SetReady(true) sent successfully")
 
-    -- Give PS99 a moment to process the request.
-    task.wait(0.10)
+    -- Real bug fix (2026-10-10, same class of bug as connectConfirm's
+    -- SetConfirmed verification - see its own doc comment for the live
+    -- incident this pattern causes): a single 0.10s wait then one GetState
+    -- check is a much shorter real polling window than this exact kind of
+    -- PS99 network call is known to need (addPet's SetItem verification
+    -- polls up to 12x at 0.05s for the identical reason). Poll for up to
+    -- ~0.5s total before falling through to the "assume true anyway"
+    -- fallback below - gives SetReady(true) a genuine chance to land
+    -- server-side instead of almost always falling back on the very first
+    -- check.
+    local myId = tostring(localPlayer.UserId)
+    for _ = 1, 10 do
+        local ok, state = pcall(function()
+            return tradingCommands.GetState()
+        end)
 
-    -- Try to verify the state.
-    local ok, state = pcall(function()
-        return tradingCommands.GetState()
-    end)
-
-    if ok and type(state) == "table" then
-        local myId = tostring(localPlayer.UserId)
-
-        -- Known PS99 format.
-        if type(state._ready) == "table" and state._ready[myId] then
-            print("[READY] Bot READY confirmed via GetState")
-            return true
+        if ok and type(state) == "table" then
+            -- Known PS99 format.
+            if type(state._ready) == "table" and state._ready[myId] then
+                print("[READY] Bot READY confirmed via GetState")
+                return true
+            end
         end
+
+        task.wait(0.05)
     end
 
     -- IMPORTANT:
@@ -1601,9 +1610,93 @@ local function addPet(uuid)
     return false, lastErr or "Pet was not added to trade"
 end
 
+-- Real bug fix (2026-10-10, found during a proactive audit): addPet()
+-- never counts a pet as successfully sent until it's actually verified
+-- present in the real PS99 trade state (GetState), retrying up to 3 times
+-- with up to 12 verification polls each. addGems() had NONE of that - it
+-- fired SetCurrency("Diamonds", amount) exactly once with a pcall and then
+-- the caller (addWithdrawalItems) immediately trusted that the full
+-- requested/available amount was sent, no verification at all. A
+-- withdrawal's gems are reported to the backend via confirmWithdrawal's
+-- sentGems field - if SetCurrency silently didn't land (the same class of
+-- "PS99 network call doesn't always take effect immediately" issue already
+-- found and fixed tonight for SetReady/SetConfirmed), the backend would be
+-- told gems were delivered that the player never actually received in
+-- Roblox, marking that part of the withdrawal fulfilled when it wasn't -
+-- a real money-integrity gap, not just a cosmetic one. There was even an
+-- already-written client_bot_gems() function meant for reading this back,
+-- sitting completely unused anywhere in the file.
+--
+-- Reads the bot's own offered Diamonds amount directly from GetState
+-- (the same authoritative trade-state source addPet uses for pets,
+-- rather than client_bot_gems()'s UI text-scraping approach, which is
+-- weaker - the same reasoning client_trade_gems() already uses for
+-- reading the OTHER player's gems).
+local function readBotOfferedGemsFromState()
+    local amount = nil
+    pcall(function()
+        local state = tradingCommands.GetState()
+        if type(state) ~= "table" or type(state._items) ~= "table" then return end
+
+        local botIndex = nil
+        if type(state._players) == "table" then
+            for index, player in pairs(state._players) do
+                if player == localPlayer then
+                    botIndex = index
+                    break
+                end
+            end
+        end
+        if botIndex == nil then return end
+
+        local botItems = state._items[botIndex]
+        if type(botItems) ~= "table" or type(botItems.Currency) ~= "table" then return end
+
+        for _, entry in pairs(botItems.Currency) do
+            if type(entry) == "table" and type(entry._data) == "table"
+                and tostring(entry._data.id) == "Diamonds"
+            then
+                local n = tonumber(entry._data._am)
+                if n then amount = math.max(0, math.floor(n)) end
+                return
+            end
+        end
+    end)
+    return amount
+end
+
+-- Returns (success, actualAmountSent). success=false means the trade state
+-- never showed the gems landing after real retries - the caller should NOT
+-- treat the gems as delivered in that case.
 local function addGems(amount)
-    -- No artificial delay; the trade state remains the source of truth.
-    pcall(function() tradingCommands.SetCurrency("Diamonds", amount) end)
+    amount = tonumber(amount) or 0
+    if amount <= 0 then return true, 0 end
+
+    for attempt = 1, 3 do
+        if attempt > 1 then
+            print("[GEMS] Retry attempt " .. attempt .. "/3 - re-sending SetCurrency(Diamonds, " .. amount .. ")")
+        end
+        pcall(function() tradingCommands.SetCurrency("Diamonds", amount) end)
+
+        for _ = 1, 12 do
+            task.wait(0.05)
+            local actual = readBotOfferedGemsFromState()
+            if actual and actual >= amount then
+                print("[GEMS] Verified " .. actual .. " Diamonds in actual trade state (requested " .. amount .. ")")
+                return true, actual
+            end
+        end
+    end
+
+    -- Could not verify via GetState after real retries. Same fallback
+    -- philosophy as readyTrade()/SetConfirmed above: PS99's GetState can
+    -- lag behind a real, successful SetCurrency call - but UNLIKE those,
+    -- getting this one wrong has direct money consequences (a withdrawal
+    -- marked fulfilled for gems the player never received), so this does
+    -- NOT optimistically report success. The caller must treat this as
+    -- "gems not confirmed sent" and keep them pending rather than guessing.
+    warn("[GEMS] Could not verify " .. amount .. " Diamonds in trade state after 3 attempts - NOT counting as sent")
+    return false, 0
 end
 
 -- ============================================================
@@ -3920,31 +4013,41 @@ local function addWithdrawalItems(withdrawalData, dryRun)
         local botBalance = getBotGemBalance()
 
         if botBalance >= gemsRequested then
+            -- Real bug fix - see addGems()'s own doc comment. lastBotGemsAdded
+            -- now reflects what addGems actually VERIFIED in the real trade
+            -- state, not blindly the requested amount - if verification
+            -- failed, these gems stay pending instead of being reported to
+            -- the backend as delivered when they may not have been.
+            local gemsOk, gemsActual = true, gemsRequested
             if not dryRun then
-                addGems(gemsRequested)
+                gemsOk, gemsActual = addGems(gemsRequested)
             end
 
-            lastBotGemsAdded = gemsRequested
+            lastBotGemsAdded = gemsOk and gemsActual or 0
+            if not gemsOk then
+                lastWithdrawalMissing.gems = gemsRequested
+            end
 
             print(
-                "[WITHDRAWAL] Added requested gems: " ..
+                "[WITHDRAWAL] " .. (gemsOk and "Added requested gems: " or "FAILED to verify requested gems: ") ..
                 tostring(gemsRequested)
             )
 
         elseif botBalance > 0 then
             -- Send EVERYTHING the bot actually has.
+            local gemsOk, gemsActual = true, botBalance
             if not dryRun then
-                addGems(botBalance)
+                gemsOk, gemsActual = addGems(botBalance)
             end
 
-            lastBotGemsAdded = botBalance
+            lastBotGemsAdded = gemsOk and gemsActual or 0
 
             lastWithdrawalMissing.gems =
-                gemsRequested - botBalance
+                gemsRequested - lastBotGemsAdded
 
             print(
                 "[WITHDRAWAL] Partial gems: sent " ..
-                tostring(botBalance) ..
+                tostring(lastBotGemsAdded) ..
                 ", missing " ..
                 tostring(lastWithdrawalMissing.gems)
             )
@@ -4536,30 +4639,71 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         lastTradeGems  = confirmGems
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
 
-        -- Fire SetConfirmed, use GetState to verify, fallback immediately if not confirmed
-        pcall(function() tradingCommands.SetConfirmed(true) end)
-        task.wait()
-        local ok, state = pcall(function() return tradingCommands.GetState() end)
+        -- Real bug fix (2026-10-10, live operator report: both sides showed
+        -- "Confirmed!" with PS99's own countdown running on a real 701M-value
+        -- trade, then it just sat there forever - no credit, no success
+        -- message, refreshing did nothing). This used to fire SetConfirmed(true)
+        -- EXACTLY ONCE, wait a single frame (task.wait() with no argument), check
+        -- GetState ONE time, and if that one immediate check didn't show
+        -- confirmed, just assume it worked anyway and move on ("marking
+        -- confirmed anyway" - see the old warn() text below, now only reached
+        -- after real retries). That is nowhere near enough time for the actual
+        -- server round-trip - readyTrade() right above waits 0.10s and addPet's
+        -- SetItem verification polls up to 12 times at 0.05s each specifically
+        -- because this exact class of PS99 network call is known to lag behind
+        -- GetState - but SetConfirmed never got that same treatment. If the one
+        -- frame wasn't enough and the real server-side confirm hadn't landed
+        -- yet, this script told itself "confirmed" and walked away while the
+        -- ACTUAL Roblox trade was still waiting on a confirm that was never
+        -- really sent - explaining a trade that visually shows "Confirmed!"
+        -- (the player's own local UI optimism) but never actually completes.
+        -- Now: up to 4 real attempts, each with its own SetConfirmed call (in
+        -- case the first one simply never reached the server) and a genuine
+        -- polling window to let it land, before ever falling back to the
+        -- old "proceed anyway" behavior - which now only fires as a true last
+        -- resort, not on the very first unlucky frame.
         local confirmed = false
-        if ok and state then
-            local myId = tostring(localPlayer.UserId)
-            if type(state._confirmed) == "table" and state._confirmed[myId] then confirmed = true end
-            if not confirmed then
-                for uid, ps in pairs(state) do
-                    if tostring(uid) == myId and type(ps) == "table" and (ps.confirmed or ps.Confirmed) then
-                        confirmed = true; break
-                    end
+        local myId = tostring(localPlayer.UserId)
+
+        local function isConfirmedNow()
+            local ok, state = pcall(function() return tradingCommands.GetState() end)
+            if not ok or not state then return false end
+            if type(state._confirmed) == "table" and state._confirmed[myId] then return true end
+            for uid, ps in pairs(state) do
+                if tostring(uid) == myId and type(ps) == "table" and (ps.confirmed or ps.Confirmed) then
+                    return true
                 end
             end
+            return false
         end
 
-                if confirmed then
+        for attempt = 1, 4 do
+            if attempt > 1 then
+                print("[CONFIRM] Retry attempt " .. attempt .. "/4 - re-sending SetConfirmed(true)")
+            end
+            pcall(function() tradingCommands.SetConfirmed(true) end)
+
+            for _ = 1, 10 do
+                task.wait(0.05)
+                if isConfirmedNow() then
+                    confirmed = true
+                    break
+                end
+            end
+
+            if confirmed then break end
+        end
+
+        if confirmed then
             botConfirmed = true
             sendMessage("Trade confirmed!")
             print("[CONFIRM] Confirmed via GetState")
         else
-            -- GetState didn't reflect it but SetConfirmed was called - proceed anyway
-            warn("[CONFIRM] Could not verify via GetState - marking confirmed anyway")
+            -- GetState never reflected it across 4 real SetConfirmed attempts
+            -- (~2 seconds of genuine polling, not one frame) - proceed anyway,
+            -- same as before, but this is now a true last resort instead of
+            -- the default outcome of any minor timing hiccup.
+            warn("[CONFIRM] Could not verify via GetState after 4 attempts - marking confirmed anyway")
             botConfirmed = true
             sendMessage("Trade confirmed!")
         end
@@ -5016,6 +5160,18 @@ local function connectMessage(localId, tradeMethod)
         -- If we exited the loop without processing, clean up safely
         if not tradeProcessed and not tradeCancelled and not goNext then
             warn("[MSG] Trade ended without success message - NOT processing to avoid incorrect trade")
+            -- Real bug fix (2026-10-10, live operator report: both sides showed
+            -- "Confirmed!" with a countdown on a real 701M-value trade, it just
+            -- sat there, nothing ever credited, refreshing did nothing). This
+            -- branch is what actually ran after 120s - it had NO sendMessage call
+            -- at all (same silent-abandonment pattern as the TRADE-WATCHDOG fix
+            -- above) AND never touched the real Roblox trade window, so the
+            -- player was left staring at a trade that looked "confirmed" forever
+            -- with zero explanation while this script had already quietly given
+            -- up and moved on internally. Tell them directly, and actually close
+            -- the stuck window instead of abandoning it mid-air.
+            sendMessage("Trade didn't complete - please re-trade. If items are gone, contact support.")
+            declineTrade()
             sendDiscord("⚠️ **TRADE NO-MSG**\n**Player:** " .. tostring(lastTradeUsername) ..
                 "\n**Method:** " .. tostring(tradeMethod) ..
                 "\nTrade ended but no success message received - items NOT processed. Check manually.", 16776960)
@@ -5478,6 +5634,39 @@ task.spawn(function()
     while true do
         task.wait(300)
         syncServerTimeOffset()
+    end
+end)
+
+-- Real gap fix (2026-10-10, found during a proactive audit, no live
+-- incident report for this specific one yet): GetSupported() - the pet
+-- catalog load, including each pet's price used as the Cosmic Value
+-- plausibility floor - only ever runs in the startup retry loop (see
+-- "STARTUP: LOAD ITEMS" above) and is never called again for the rest of
+-- this bot process's lifetime, which tonight's logs show commonly running
+-- for hours. Any pet added to the site's catalog, or any price change,
+-- after this bot started would be completely invisible to it until
+-- someone manually restarts the script - a new pet would show as
+-- "Unsupported/unmapped item" and get rejected outright, and a price
+-- change wouldn't be reflected in the plausibility floor used to
+-- sanity-check Cosmic Value reads. GetSupported() itself is safe to call
+-- again later: it only resets/rebuilds catalogByKey/supporteditems/etc.
+-- synchronously with no task.wait() in between the reset and the rebuild
+-- completing, so no other coroutine can ever observe a half-empty catalog
+-- mid-refresh (Lua's coroutines only switch at an actual yield point).
+-- Skipped while a trade is actively being processed anyway, purely as
+-- extra caution, even though it's not strictly required for correctness.
+task.spawn(function()
+    while true do
+        task.wait(600)
+        if not activeIncomingTrade then
+            print("[ITEMS] Periodic catalog refresh starting...")
+            local ok = GetSupported()
+            if ok then
+                print("[ITEMS] Periodic catalog refresh OK - " .. #supporteditems .. " entries")
+            else
+                warn("[ITEMS] Periodic catalog refresh failed - keeping previous catalog")
+            end
+        end
     end
 end)
 
