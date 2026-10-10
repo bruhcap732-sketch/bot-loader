@@ -2874,6 +2874,23 @@ local function normalizeWithdrawalInventoryText(v)
         :gsub("%s+$", "")
 end
 
+-- Real incident (2026-10-10, live log): a withdrawal couldn't find "Shiny
+-- Huge Kawaii Dragon" or "Shiny Huge Fireball Cat" in the bot's own
+-- inventory (matchableCount=0) even though the Kawaii Dragon had JUST been
+-- deposited into this exact bot seconds earlier and the heartbeat's own
+-- heldItemGroups count grew to include it. Golden/Rainbow pets in the same
+-- withdrawal matched fine - only plain "Shiny" (no golden/rainbow combo)
+-- failed. withdrawalPetVariant() only recognises shiny via a `shiny`/
+-- `isShiny` field (see its own doc comment) - if PS99's real save record
+-- uses some other field/shape for plain-shiny specifically, every shiny
+-- pet is silently unmatchable forever (fails safe - it just stays
+-- "missing"/pending, never lost or duplicated - but a player's otherwise
+-- real holdings become permanently unwithdrawable, which is its own
+-- serious problem). One-time-per-UUID raw dump of exactly these two known-
+-- shiny pets' real fields, so the next withdrawal attempt shows the actual
+-- schema instead of guessing at it again.
+local shinyProbeDumped = {}
+
 local function getHugesTitanics(requestedItems)
     -- IMPORTANT:
     -- Only inspect the live player inventory. The previous recursive save scan
@@ -2947,6 +2964,28 @@ local function getHugesTitanics(requestedItems)
 
         local isGargantuan = idNorm:find("gargantuan", 1, true) ~= nil
             or nameNorm:find("gargantuan", 1, true) ~= nil
+
+        -- See shinyProbeDumped's own doc comment above getHugesTitanics.
+        if not shinyProbeDumped[uuidStr]
+            and (idNorm:find("kawaii dragon", 1, true) or nameNorm:find("kawaii dragon", 1, true)
+                or idNorm:find("fireball cat", 1, true) or nameNorm:find("fireball cat", 1, true))
+        then
+            shinyProbeDumped[uuidStr] = true
+            print("[SHINY-PROBE] " .. tostring(name) .. " uuid=" .. uuidStr .. " computedVariant=" .. tostring(variant))
+            for k, v in pairs(pet) do
+                print("[SHINY-PROBE]   " .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
+            end
+            if type(pet._data) == "table" then
+                for k, v in pairs(pet._data) do
+                    print("[SHINY-PROBE]   _data." .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
+                end
+            end
+            if type(pet.data) == "table" then
+                for k, v in pairs(pet.data) do
+                    print("[SHINY-PROBE]   data." .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
+                end
+            end
+        end
 
         -- IMPORTANT:
         -- The old scanner only returned Huge/Titanic/Gargantuan pets.
