@@ -3246,11 +3246,31 @@ local function getStableWithdrawalInventory(requestedItems)
         return true
     end
 
-    -- FAST PATH:
-    -- One live Inventory.Pet snapshot is normally enough. If the save just
-    -- changed, allow only two additional very short refreshes. The previous
-    -- 20 x 0.25s loop added ~5 seconds to every withdrawal.
-    local MAX_ATTEMPTS = 3
+    -- Real bug fix (2026-10-10, live operator report: withdrawals failing/
+    -- rejecting pets the bot had genuinely just received - "it's accepting
+    -- the trade without detecting it and then updating the site"). The old
+    -- version gave up after just TWO reads 0.10s apart coming back
+    -- identical and called that "stable" - but two reads 0.1s apart of a
+    -- save table PS99 hasn't finished replicating yet are trivially
+    -- identical (nothing had time to change), which is not the same thing
+    -- as the data being final. A pet that was JUST received via a real
+    -- trade can take longer than 0.2s total for PS99's own save system to
+    -- actually reflect - this returned that stale/incomplete snapshot as
+    -- if it were done, which is exactly what made a genuinely-held pet
+    -- read as "missing" and fail a real withdrawal.
+    --
+    -- The FOUND-immediately path is unchanged below (still returns the
+    -- instant requested items show up - zero added delay for the normal,
+    -- already-caught-up case, which is most withdrawals). Only the
+    -- NOT-found path now spends real time confirming before conceding:
+    -- more attempts, spaced further apart, and three consecutive identical
+    -- reads (not two) before deciding the item really isn't there. Costs
+    -- up to ~2.4s extra ONLY when something is actually missing or PS99 is
+    -- genuinely lagging - a real withdrawal wrongly failing outright is a
+    -- far worse outcome than a few extra seconds of polling.
+    local MAX_ATTEMPTS = 8
+    local RETRY_DELAY_SECONDS = 0.3
+    local REQUIRED_STABLE_READS = 3
     for attempt = 1, MAX_ATTEMPTS do
         latest = getHugesTitanics(requestedItems)
 
@@ -3267,29 +3287,29 @@ local function getStableWithdrawalInventory(requestedItems)
         print("[WITHDRAWAL-INVENTORY] Snapshot " .. tostring(attempt) ..
             "/" .. tostring(MAX_ATTEMPTS) ..
             " | pets=" .. tostring(#latest) ..
-            " | stable=" .. tostring(stableCount) .. "/2" ..
+            " | stable=" .. tostring(stableCount) .. "/" .. tostring(REQUIRED_STABLE_READS) ..
             " | requestedPresent=" .. tostring(targetsPresent))
 
-        -- Do not require two snapshots when the requested items are already
-        -- visible in the live inventory. That makes normal withdrawals fast.
+        -- Do not require multiple snapshots when the requested items are
+        -- already visible in the live inventory. That keeps normal
+        -- withdrawals just as fast as before this fix.
         if targetsPresent then
             print("[WITHDRAWAL-INVENTORY] Requested items found in live inventory; proceeding immediately")
             return latest
         end
 
-        if stableCount >= 2 then
-            -- Inventory has stabilized even though the request wasn't found.
-            -- Return now instead of spending another several seconds polling.
-            print("[WITHDRAWAL-INVENTORY] Inventory stabilized; requested item still not found")
+        if stableCount >= REQUIRED_STABLE_READS then
+            print("[WITHDRAWAL-INVENTORY] Inventory stabilized across " .. tostring(REQUIRED_STABLE_READS) ..
+                " reads; requested item still not found")
             return latest
         end
 
         if attempt < MAX_ATTEMPTS then
-            task.wait(0.10)
+            task.wait(RETRY_DELAY_SECONDS)
         end
     end
 
-    print("[WITHDRAWAL-INVENTORY] Using latest snapshot after fast sync window")
+    print("[WITHDRAWAL-INVENTORY] Using latest snapshot after extended sync window")
     return latest
 end
 
