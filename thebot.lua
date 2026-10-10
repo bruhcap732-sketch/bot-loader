@@ -1124,27 +1124,24 @@ end
 -- ============================================================
 -- CHAT & DISCORD
 -- ============================================================
--- Operator request (speed over in-trade chat): every call used to block the
--- trade loop for 200-500ms (humanDelay) before sending a Roblox chat line
--- players never needed to act on - every call site already has its own
--- real signal (the site UI, Discord logs via sendDiscord below) independent
--- of this text. Left as a no-op stub, not deleted, so every existing call
--- site still compiles unchanged - only the blocking chat send goes away.
-local function sendMessage(_message)
-end
-
--- Real gap fix (2026-10-10, same incident as serverTimeOffset above): once
--- sendMessage became a no-op, the reasoning was "every call site has its
--- own real signal (site UI, Discord)" - true for normal progress updates,
--- false for the one case that matters most: a deposit/withdrawal credit
--- call failing AFTER the real Roblox trade already completed. The pet is
--- genuinely gone, the site never got it, Discord is commonly left blank,
--- and with sendMessage silenced there was NOTHING telling the player (or
--- the operator watching over their shoulder) that anything had gone
--- wrong. This is the original pre-no-op chat implementation, kept as its
--- own function used ONLY at genuine failure points (see its call sites)
--- so the speed win for the normal, successful path is untouched - this
--- is not a revert of that decision, just a safety exception to it.
+-- Real bug fix (2026-10-10, live operator report: trade got claimed by the
+-- bot, never actually progressed, TRADE-WATCHDOG silently released it 90s
+-- later - operator saw a failed deposit with ZERO explanation anywhere).
+-- sendMessage used to be a hard no-op ("every call site has its own real
+-- signal - the site UI, Discord") - that reasoning only holds for the
+-- happy path. Every ABANDONMENT path in this file (accept failed, ready
+-- failed, timed out, never readied, banned, backend lookup failed, stale
+-- lock released, swap detected, etc.) also calls sendMessage, and ALL of
+-- them went completely silent together with it - the "real signal"
+-- (Discord) is commonly left blank (discordWebhook = ""), so there was
+-- NOTHING telling the player a trade had just been abandoned. A handful of
+-- the worst call sites already got manually upgraded to sendCriticalMessage
+-- earlier tonight, but that only patched two spots in a script with 50+
+-- sendMessage call sites, most of them still silent. Routing sendMessage
+-- itself through the real chat implementation (task.spawn'd so the
+-- trade loop is never blocked waiting on it - preserves the original speed
+-- win) fixes every one of those silent call sites at once instead of
+-- hunting them down one at a time.
 local function sendCriticalMessage(message)
     local sent = false
     pcall(function()
@@ -1159,6 +1156,14 @@ local function sendCriticalMessage(message)
                 :FireServer(tostring(message), "All")
         end)
     end
+end
+
+-- Non-blocking wrapper so every existing sendMessage(...) call site in the
+-- trade loop (50+ of them) gets a real chat message again without ever
+-- making the trade loop itself wait on the chat send - task.spawn fires it
+-- off and moves on immediately, same speed as the old no-op version.
+local function sendMessage(message)
+    task.spawn(sendCriticalMessage, message)
 end
 
 local function sendDiscord(message, color)
@@ -5537,6 +5542,12 @@ task.spawn(function()
             and not isInTrade()
         then
             warn("[TRADE-WATCHDOG] Stale incoming-trade lock detected - releasing safely")
+            -- This path previously had NO player-facing message at all (not even
+            -- the no-op sendMessage - it was never called here), so a trade that
+            -- got silently dropped by this exact watchdog gave the player zero
+            -- indication anything had happened. Now that sendMessage actually
+            -- sends again (see its own doc comment), tell them directly.
+            sendMessage("Trade didn't go through - please re-trade.")
             sendDiscord(
                 "⚠️ **TRADE LOCK RECOVERY**\n" ..
                 "A stale incoming-trade lock was detected after 90 seconds with no active Roblox trade.\n" ..
