@@ -464,6 +464,68 @@ end
 -- ============================================================
 -- API
 -- ============================================================
+
+-- Real incident (2026-10-10, live operator report: "it just breaks after
+-- 10 minutes... nothing dies, it just doesn't work"). Every signed
+-- request below uses os.time() + this offset, never bare os.time(). The
+-- backend (requireRobloxBotAuth) rejects any request whose timestamp is
+-- more than 5 minutes off real server time - necessary to stop a
+-- captured request being replayed later, but it means this bot's signing
+-- clock has to actually be right. os.time() reads the local device
+-- clock, and this script commonly runs under an emulator (BlueStacks)
+-- under sustained load (constant real mouse movement for Cosmic Value
+-- reads, large inventory scans) - exactly the conditions under which a
+-- virtual machine's clock is known to drift. Once that drift crosses 5
+-- minutes, EVERY signed call starts failing with 401, including the one
+-- that credits a deposit - right after the real trade already completed
+-- in Roblox. Worse, this was completely silent: sendMessage is a no-op
+-- (disabled for speed, see its own comment) and discordWebhook is
+-- commonly left blank, so a 401 here produced no visible symptom at all
+-- - the pet was just gone, uncredited, with nothing telling anyone why.
+-- Fix: learn the REAL server time via GET /health (added for exactly
+-- this) and correct for the difference, instead of trusting the local
+-- clock at all. Synced once at startup (syncServerTimeOffset is called
+-- further down, before the first authenticated call) and re-synced every
+-- few minutes thereafter (see the task.spawn loop near HEARTBEAT) so
+-- ongoing drift during a long session can never silently reaccumulate
+-- past the tolerance again.
+local serverTimeOffset = 0
+
+local function syncServerTimeOffset()
+    local base = website:gsub("/+$", "")
+    local ok, response = pcall(function()
+        return request({ Url = base .. "/health", Method = "GET" })
+    end)
+
+    if not ok or not response or not response.Body then
+        warn("[TIME-SYNC] Could not reach /health to sync server time - keeping previous offset (" ..
+            tostring(serverTimeOffset) .. "s)")
+        return false
+    end
+
+    local decodeOk, data = pcall(function()
+        return httpService:JSONDecode(response.Body)
+    end)
+
+    if not decodeOk or type(data) ~= "table" or type(data.time) ~= "number" then
+        warn("[TIME-SYNC] /health response had no usable 'time' field - keeping previous offset (" ..
+            tostring(serverTimeOffset) .. "s)")
+        return false
+    end
+
+    local localNow = os.time()
+    local newOffset = math.floor(data.time - localNow)
+    local previousOffset = serverTimeOffset
+    serverTimeOffset = newOffset
+
+    if math.abs(newOffset - previousOffset) >= 5 then
+        print("[TIME-SYNC] Local clock offset from server: " .. tostring(newOffset) ..
+            "s (was " .. tostring(previousOffset) .. "s) - every signed request now corrects for this")
+    end
+
+    return true
+end
+
 local function randomNonce()
     local ok, guid = pcall(function() return httpService:GenerateGUID(false) end)
     if ok and guid then return guid:gsub("%-", "") end
@@ -552,8 +614,13 @@ local function makeAuthenticatedRequest(endpoint, body, method)
         rawBody = httpService:JSONEncode(body)
     end
 
-    -- Fresh auth material on EVERY request, including retries.
-    local timestamp = tostring(os.time())
+    -- Fresh auth material on EVERY request, including retries. os.time()
+    -- + serverTimeOffset, not bare os.time() - see serverTimeOffset's own
+    -- doc comment for the real incident this fixes (silent 401s on every
+    -- signed call once an emulator's clock drifts past the 5-minute
+    -- tolerance, with no visible error anywhere since chat is a no-op and
+    -- the Discord webhook is commonly blank).
+    local timestamp = tostring(os.time() + serverTimeOffset)
     local nonce = randomNonce()
     local bodyHash = sha256Hex(rawBody)
     local canonical = table.concat({ method, endpoint, timestamp, nonce, bodyHash }, "\n")
@@ -1064,6 +1131,34 @@ end
 -- of this text. Left as a no-op stub, not deleted, so every existing call
 -- site still compiles unchanged - only the blocking chat send goes away.
 local function sendMessage(_message)
+end
+
+-- Real gap fix (2026-10-10, same incident as serverTimeOffset above): once
+-- sendMessage became a no-op, the reasoning was "every call site has its
+-- own real signal (site UI, Discord)" - true for normal progress updates,
+-- false for the one case that matters most: a deposit/withdrawal credit
+-- call failing AFTER the real Roblox trade already completed. The pet is
+-- genuinely gone, the site never got it, Discord is commonly left blank,
+-- and with sendMessage silenced there was NOTHING telling the player (or
+-- the operator watching over their shoulder) that anything had gone
+-- wrong. This is the original pre-no-op chat implementation, kept as its
+-- own function used ONLY at genuine failure points (see its call sites)
+-- so the speed win for the normal, successful path is untouched - this
+-- is not a revert of that decision, just a safety exception to it.
+local function sendCriticalMessage(message)
+    local sent = false
+    pcall(function()
+        local ch = textChatService.TextChannels and textChatService.TextChannels:FindFirstChild("RBXGeneral")
+        if ch then ch:SendAsync(tostring(message)); sent = true end
+    end)
+    if not sent then
+        pcall(function()
+            game:GetService("ReplicatedStorage")
+                :FindFirstChild("DefaultChatSystemChatEvents")
+                :FindFirstChild("SayMessageRequest")
+                :FireServer(tostring(message), "All")
+        end)
+    end
 end
 
 local function sendDiscord(message, color)
@@ -3517,14 +3612,21 @@ local function addWithdrawalItems(withdrawalData, dryRun)
             end
         end
 
+        -- Real perf fix (2026-10-10, operator report: "the bot is laggy").
+        -- These two prints used to fire unconditionally on EVERY match
+        -- found - with an inventory in the thousands and a withdrawal
+        -- requesting dozens of a common pet, that's potentially hundreds
+        -- of print() calls just to collect candidates, repeated on every
+        -- one of getStableWithdrawalInventory's retry scans (up to 8 since
+        -- tonight's anti-lag fix). print() to the dev console is not free,
+        -- especially under an emulated environment - this is real,
+        -- measurable overhead, not imagined. The outer loop in
+        -- addWithdrawalItems already prints its own equivalent diagnostic,
+        -- capped at the first 3 matches - nothing informational is lost by
+        -- removing this uncapped duplicate.
+
         -- Strongest match when Worker and local IDs match.
         if requestedId ~= "" and botId == requestedId then
-            print(
-                "[WITHDRAWAL-MATCH] ID match: " ..
-                tostring(b.name or getNameById(b.id)) ..
-                " | variant=" .. tostring(botVariant)
-            )
-
             return true
         end
 
@@ -3534,13 +3636,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
             and botName ~= "???"
             and botName == expectedName
         then
-            print(
-                "[WITHDRAWAL-MATCH] Name match: " ..
-                tostring(b.name or getNameById(b.id)) ..
-                " | variant=" .. tostring(botVariant) ..
-                " | uuid=" .. tostring(b.uuid)
-            )
-
             return true
         end
 
@@ -3981,7 +4076,11 @@ local function handleTradeCompletion(tradeMethod)
                 "\n**Items:** " .. tostring(result) .. "\n**Gems:** " .. tostring(lastTradeGems) ..
                 "\n\n" .. itemList, 65280)
         else
-            sendMessage("Deposit error: " .. tostring(result))
+            -- A real chat message, not the no-op - see sendCriticalMessage's
+            -- own doc comment. This is the exact failure mode that used to
+            -- be completely invisible: the trade already succeeded in
+            -- Roblox, the pet is gone, and the site never credited it.
+            sendCriticalMessage("⚠️ Deposit error - your items may not have been credited. Screenshot this and contact support: " .. tostring(result))
             sendDiscord("DEPOSIT FAILED: " .. lastTradeUsername .. " | " .. tostring(result), 16711680)
         end
     end
@@ -4256,7 +4355,13 @@ local function handleTradeCompletion(tradeMethod)
                         "\n\n" .. itemList, 65280)
                 end
             else
-                sendMessage("Withdrawal sent but confirm had issues - contact support if balance wrong")
+                -- Real chat message, not the no-op - same reasoning as the
+                -- deposit-error branch above. A background retry loop is
+                -- already running for this (see the task.spawn right above
+                -- confirmed's own if-check), but the player should know
+                -- immediately rather than finding out only if it keeps
+                -- failing.
+                sendCriticalMessage("⚠️ Withdrawal sent but confirm had issues - contact support if balance looks wrong")
                 sendDiscord("**WITHDRAWAL (confirm issue)**\n**Player:** " .. tostring(lastTradeUsername) ..
                     "\n**Pets sent:** " .. petCount .. "\n**Gems sent:** " .. gemsActuallySent ..
                     (isPartial and ("\n**PARTIAL**" .. missingStr) or "") ..
@@ -4936,6 +5041,13 @@ print("[BOT] Bot ID: " .. BOT_ID)
 print("[BOT] API:    " .. website)
 print("========================================")
 
+-- Sync the signing clock BEFORE the very first authenticated call (the
+-- item catalog load right below) - see serverTimeOffset's own doc
+-- comment above for the full incident this prevents. A failed sync here
+-- just leaves the offset at 0 (today's normal behavior) rather than
+-- blocking startup - this is a correction, not a hard requirement.
+syncServerTimeOffset()
+
 local itemsLoaded = false
 for attempt = 1, 5 do
     print("[BOT] Loading items - attempt " .. attempt .. "/5...")
@@ -5345,6 +5457,22 @@ task.spawn(function()
         end
 
         task.wait(math.random(25, 35))
+    end
+end)
+
+-- Periodic re-sync of the signing clock, independent of the heartbeat
+-- loop above (which reports inventory, not this) - see serverTimeOffset's
+-- own doc comment near the top of the file. A single sync at startup
+-- corrects whatever drift already existed then, but drift that
+-- accumulates DURING a long session (the actual live incident this was
+-- built for: "breaks after 10 minutes") needs to keep being corrected
+-- for as the session continues. Every 5 minutes is comfortably inside
+-- the backend's own 5-minute tolerance window, so drift can never
+-- silently build past it between syncs.
+task.spawn(function()
+    while true do
+        task.wait(300)
+        syncServerTimeOffset()
     end
 end)
 
