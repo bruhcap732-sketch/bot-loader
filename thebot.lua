@@ -474,9 +474,26 @@ local withdrawalHoldUntil = {}
 -- Throttles the repeated-request log/decline below to once a second per
 -- user instead of once per loop tick (every 0.05s) - the main loop was
 -- printing and re-declining the same held request ~20x/second for the
--- entire cooldown window, flooding the console log.
+-- entire cooldown window, flooding the console log. This throttle is
+-- INDEPENDENT of WITHDRAWAL_HOLD_COOLDOWN below and stays in place
+-- regardless of that value - it's what actually prevents a real spam
+-- loop against Roblox's own DeclineRequest/the backend, not the hold
+-- duration itself.
 local lastHoldDeclineAt = {}
-local WITHDRAWAL_HOLD_COOLDOWN = 30
+-- Operator request (2026-10-11): "can you remove that timer... if you
+-- can't detect it, you don't detect it, they just have to send a new
+-- trade." Cut from 30s to 2s - not all the way to 0, on purpose: this
+-- cooldown exists because a declined trade request can keep re-appearing
+-- in Roblox's own incoming-request list for a bit after being declined
+-- (not under this script's control), and the main loop re-scans every
+-- 0.05s - a 0s cooldown means re-running the FULL check-user-banned API
+-- call and a real DeclineRequest call up to ~20 times/second for as long
+-- as that happens, not just a log line. 2s keeps a blocked player's retry
+-- feeling near-instant (not the old 30s wait) while still keeping real
+-- API/Roblox-call volume sane. Push this to a smaller number (or 0) if
+-- the 2s still feels too slow - just know 0 means genuinely uncapped
+-- repeated API+Roblox calls while a lingering request is still visible.
+local WITHDRAWAL_HOLD_COOLDOWN = 2
 local method             = nil
 local tradeId            = 0
 local lastTradeUsername  = nil
@@ -1141,6 +1158,59 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
         ("HTTP " .. tostring(lastStatus or "?")), lastData
 end
 
+-- Operator request (2026-10-11): "what if one request didn't go
+-- through... checks the site admin panel... sees oh this hasn't
+-- credited, this person back." A genuine independent recheck, not just
+-- trusting process-deposit's own response - a short while after a
+-- deposit the bot believes succeeded, this asks the backend again
+-- whether it actually agrees, using the exact same tradeId both calls
+-- share. If anything disagrees with what the player was already told,
+-- this is loud about it (Discord, not just a console line) rather than
+-- silently trusting the first "success" the way the whole night's worth
+-- of confusion started.
+local function verifyDepositLanded(transactionTradeId, username, expectedGems, expectedItemCount)
+    task.delay(15, function()
+        local s, r = makeAuthenticatedRequest("/api/bots/verify-deposit", { tradeId = transactionTradeId }, "POST")
+        local data = decodeBody(r)
+        local status = s and r and tonumber(r.StatusCode) or nil
+
+        if not (s and r and status == 200 and data and data.success) then
+            warn("[DEPOSIT-VERIFY] Could not reach backend to recheck deposit for " .. tostring(username) ..
+                " | tradeId=" .. tostring(transactionTradeId) .. " | HTTP " .. tostring(status))
+            sendDiscord("⚠️ **DEPOSIT RECHECK FAILED (network)**\n**Player:** " .. tostring(username) ..
+                "\n**tradeId:** " .. tostring(transactionTradeId) ..
+                "\nCould not reach the backend to independently confirm this deposit actually landed - check manually.",
+                16776960)
+            return
+        end
+
+        if not data.found then
+            warn("[DEPOSIT-VERIFY] MISSING: no deposit record found for " .. tostring(username) ..
+                " | tradeId=" .. tostring(transactionTradeId))
+            sendDiscord("🚨 **DEPOSIT NOT FOUND ON RECHECK**\n**Player:** " .. tostring(username) ..
+                "\n**tradeId:** " .. tostring(transactionTradeId) ..
+                "\n**Expected:** " .. tostring(expectedItemCount) .. " item(s) + " .. tostring(expectedGems) .. " gems" ..
+                "\nThe bot reported this deposit as a success, but a follow-up check 15s later found NO matching deposit record at all. The player may need to be credited manually.",
+                16711680)
+            return
+        end
+
+        if data.status ~= "CREDITED" then
+            warn("[DEPOSIT-VERIFY] Deposit exists but status=" .. tostring(data.status) .. " (expected CREDITED) for " .. tostring(username))
+            sendDiscord("⚠️ **DEPOSIT NOT CREDITED ON RECHECK**\n**Player:** " .. tostring(username) ..
+                "\n**tradeId:** " .. tostring(transactionTradeId) ..
+                "\n**Status:** " .. tostring(data.status) ..
+                "\n**Gems recorded:** " .. tostring(data.gemsReceived) ..
+                "\nThe bot told the player this was deposited, but the backend has it sitting in a non-credited state - check and resolve manually.",
+                16776960)
+            return
+        end
+
+        print("[DEPOSIT-VERIFY] OK - confirmed CREDITED for " .. tostring(username) ..
+            " | tradeId=" .. tostring(transactionTradeId) .. " | gems=" .. tostring(data.gemsReceived))
+    end)
+end
+
 local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfilledItems, missingPets, missingGems, sentGems)
     if not withdrawalData or not withdrawalData.id then
         return false, "Missing withdrawal id"
@@ -1639,27 +1709,42 @@ local function acceptTradeRequest(player)
         return id
     end
 
-    -- Short fallback sequence. This is intentionally bounded and does not
-    -- spam all 15 old attempts when the game simply needs another tick.
+    -- Operator request (2026-10-11): "make the bot accept the trade as
+    -- fast as possible." Real speed fix - AcceptRequest is confirmed NEVER
+    -- available on this PS99 build (every single live log says "skipping"),
+    -- so every real accept already goes through this fallback loop, not
+    -- the fast path above. The OLD version called checkAccepted() (its own
+    -- up-to-4x25ms poll, ~100ms worst case) separately after EACH of the
+    -- three commands below, every single outer iteration - if the first
+    -- command (Request) didn't work, that was a wasted ~100ms poll before
+    -- even trying Accept, then potentially another wasted ~100ms before
+    -- trying RemoteAccept (the one that live logs show actually working -
+    -- "AcceptRequest is not available... skipping" is always immediately
+    -- followed by a successful accept, with nothing printed about Request/
+    -- Accept failing first). Firing all three commands back-to-back THEN
+    -- polling ONCE cuts that redundant waiting roughly 3x per outer
+    -- iteration, with no loss of reliability - all three still get tried
+    -- every iteration, just without an unnecessary poll gap between them.
     for attempt = 1, 6 do
         if type(tradingCommands.Request) == "function" then
-            id = tryCommand(function() tradingCommands.Request(player) end, "Request")
-            if id then return id end
+            pcall(function() tradingCommands.Request(player) end)
         end
-
         if type(tradingCommands.Accept) == "function" then
-            id = tryCommand(function() tradingCommands.Accept(player) end, "Accept")
-            if id then return id end
+            pcall(function() tradingCommands.Accept(player) end)
         end
-
-        id = tryCommand(function()
+        pcall(function()
             local evts = replicatedStorage:FindFirstChild("Network") or replicatedStorage:FindFirstChild("Remotes")
             if evts then
                 local e = evts:FindFirstChild("AcceptTrade") or evts:FindFirstChild("Trading_Accept")
                 if e and e:IsA("RemoteEvent") then e:FireServer(player) end
             end
-        end, "RemoteAccept")
-        if id then return id end
+        end)
+
+        id = checkAccepted()
+        if id then
+            print("[ACCEPT] Trade opened on fallback attempt " .. attempt .. "/6: " .. tostring(id))
+            return id
+        end
 
         print("[ACCEPT] Fast fallback " .. attempt .. "/6 failed...")
         task.wait(0.05)
@@ -4442,6 +4527,13 @@ local function handleTradeCompletion(tradeMethod)
         local success, result = processDeposit(lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, bypassMin)
         logStep(9, "process-deposit API responded | success=" .. tostring(success) .. " | result=" .. tostring(result))
         if success then
+            -- Independent recheck 15s later - see verifyDepositLanded's own
+            -- doc comment. Same tradeId both calls share, recomputed the
+            -- same way processDeposit derives it internally.
+            local verifyTradeId = makeStableTradeTransactionId(lastGameTradeId)
+            if verifyTradeId then
+                verifyDepositLanded(verifyTradeId, lastTradeUsername, lastTradeGems, #lastTradeItems)
+            end
             -- Operator report (2026-10-01): "make the bot stop typing in
             -- the chat" - traced to Roblox's own anti-link filter turning
             -- any chat message containing "bloxyflip.fun" into a wall of
