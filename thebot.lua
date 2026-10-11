@@ -3360,7 +3360,10 @@ local function handleTradeCompletion(tradeMethod)
             end
         end
 
-        tryProcessDeposit(true)
+        -- No tryProcessDeposit(true) here on purpose: withdrawals can no
+        -- longer carry any deposit items (see the WITHDRAW-GUARD cancel
+        -- in connectStatus) - combining the two in one trade was the dupe
+        -- glitch the operator flagged, for Huge pets and gems specifically.
     end
 
     print("[COMPLETE] Releasing trade and closing window")
@@ -3556,22 +3559,43 @@ local function connectStatus(localId, tradeMethod)
 
                 elseif tradeMethod == "withdraw" then
                     local hasError, output = checkItems(true)
-                    if hasError then
+                    local depositGems = client_trade_gems()
+
+                    -- Adding pets/gems to a withdrawal trade used to get
+                    -- processed as a bonus deposit once the withdrawal
+                    -- completed (tryProcessDeposit(true) in
+                    -- handleTradeCompletion) - operator identified this as
+                    -- a dupe glitch, specifically for Huge pets and gems.
+                    -- Withdrawals and deposits are no longer allowed to
+                    -- combine in one trade: if the player added ANYTHING
+                    -- on their side during a withdrawal, cancel outright
+                    -- instead of readying.
+                    if (not hasError and #output > 0) or depositGems > 0 then
+                        warn("[WITHDRAW-GUARD] Player added items/gems during withdrawal - declining trade to prevent dupe (pets=" ..
+                            tostring(#output) .. " gems=" .. tostring(depositGems) .. ")")
+                        sendMessage("Don't add items/gems during a withdrawal - trade cancelled. Re-trade to try again.")
+                        tradeCancelled = true
+                        tradeProcessed = true
+                        if lastWithdrawalData then
+                            local wdData = lastWithdrawalData.data or lastWithdrawalData
+                            cancelWithdrawalTrade(wdData, "Items/gems added during withdrawal - dupe prevention", true)
+                        end
+                        declineTrade()
+                        goNext = true
+                        releaseIncomingTradeLock()
+                        resetTradeState()
+                        return
+                    elseif hasError then
                         sendMessage(tostring(output))
                         pcall(function() tradingCommands.SetReady(false) end)
                         wasReady = true
                         task.wait(1)
                     else
-                        local depositGems = client_trade_gems()
                             lastTradeItems = output
                             lastTradeGems  = depositGems
                             hasReadied     = true
 
-                            if #lastTradeItems > 0 or lastTradeGems > 0 then
-                                sendMessage("Validated deposit: " .. #lastTradeItems .. " pets + " .. formatDepositGemCredit(lastTradeGems))
-                            else
-                                sendMessage("Processing your withdrawal...")
-                            end
+                            sendMessage("Processing your withdrawal...")
 
                             if #lastWithdrawalMissing.pets > 0 then
                                 sendMessage("Note: " .. #lastWithdrawalMissing.pets .. " pet(s) out of stock - will stay pending")
@@ -4019,7 +4043,25 @@ task.spawn(function()
 
         task.wait(0.05)
 
-        if not goNext then
+        if not goNext or activeIncomingTrade then
+            -- Bot is busy with an active trade (deposit OR withdrawal).
+            -- Explicitly DECLINE any other incoming trade request right
+            -- now instead of leaving it queued and silently ignored. A
+            -- second request left pending while the current withdrawal is
+            -- still being readied/confirmed/closed is exactly the window
+            -- where leftover state from the first trade (lastTradeItems,
+            -- lastItemsGiven, cvCache, etc.) could bleed into whatever
+            -- trade gets auto-accepted next once the bot frees up - that's
+            -- the dupe-risk scenario. Declining it now forces a clean,
+            -- separate trade after the bot is actually free.
+            local busyIncoming = getTrades()
+            for _, busyTrade in ipairs(busyIncoming) do
+                pcall(function()
+                    if type(tradingCommands.DeclineRequest) == "function" then
+                        tradingCommands.DeclineRequest(busyTrade)
+                    end
+                end)
+            end
             continue
         end
 
