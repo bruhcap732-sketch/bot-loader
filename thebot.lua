@@ -153,14 +153,51 @@ do
     local logService = game:GetService("LogService")
     local userInputService = game:GetService("UserInputService")
 
-    local LOG_BUFFER_MAX = 6000
+    -- Real gap fix (2026-10-11, operator report: a trade's balance update
+    -- was confirmed real/correct, but by the time F5 was pressed later,
+    -- nothing about that trade was in the copied log any more - "I gave
+    -- you so many console logs... you can't diagnose it, that means the
+    -- console's not the problem"). The in-memory ring buffer below is
+    -- capped at LOG_BUFFER_MAX lines - with this script printing a line
+    -- or more every few seconds just from heartbeats/gem-balance/inventory
+    -- scans even when nothing is happening, that cap can cycle through and
+    -- silently drop evidence of a real trade from earlier in a long
+    -- session, well before anyone presses F5. Raised as a cheap first
+    -- safety margin (6000 -> 20000 lines - still a bounded, small amount
+    -- of memory, just a much longer runway).
+    --
+    -- The actual fix is the second layer below: every line is ALSO
+    -- appended to a real file on disk (writefile/appendfile, standard
+    -- executor file API), which has no line cap at all - it keeps
+    -- everything for the entire session regardless of how long the bot
+    -- has been running or how much has printed since. A second button/
+    -- hotkey (F6 / "Copy FULL Log (F6)") reads that file back and copies
+    -- the complete session history, not just whatever's left in the
+    -- bounded in-memory window - so "I pressed F5 an hour after the trade
+    -- happened" can no longer lose the evidence the way it just did.
+    local LOG_BUFFER_MAX = 20000
     local logBuffer = {}
+
+    local LOG_FILE = "bloxyflip_bot_session_log.txt"
+    local hasFileApi = type(writefile) == "function" and type(appendfile) == "function"
+    if hasFileApi then
+        -- Fresh file per script execution - makeAuthenticatedRequest signs
+        -- every request with the running session, so "this session's full
+        -- log" is the useful unit, not an ever-growing cross-session file.
+        pcall(function() writefile(LOG_FILE, "=== BloxyFlip bot session log started " .. os.date("%Y-%m-%d %H:%M:%S") .. " ===\n") end)
+    else
+        warn("[LOG-COPY] No writefile/appendfile in this executor - full-session file logging unavailable, only the " .. tostring(LOG_BUFFER_MAX) .. "-line in-memory buffer will be available via F5")
+    end
 
     pcall(function()
         logService.MessageOut:Connect(function(message, _messageType)
-            table.insert(logBuffer, tostring(message))
+            local line = tostring(message)
+            table.insert(logBuffer, line)
             if #logBuffer > LOG_BUFFER_MAX then
                 table.remove(logBuffer, 1)
+            end
+            if hasFileApi then
+                pcall(appendfile, LOG_FILE, line .. "\n")
             end
         end)
     end)
@@ -190,7 +227,30 @@ do
     corner.CornerRadius = UDim.new(0, 6)
     corner.Parent = button
 
+    -- Second button, stacked right below the first - copies the FULL
+    -- on-disk session log (see LOG_FILE above), not the bounded in-memory
+    -- window. This is the one to use for "something happened a while ago
+    -- and I want the whole story," since it can never have silently
+    -- dropped older lines the way the F5 buffer can over a long session.
+    local fullButton = Instance.new("TextButton")
+    fullButton.Name = "CopyFullLogButton"
+    fullButton.Size = UDim2.new(0, 140, 0, 36)
+    fullButton.Position = UDim2.new(1, -150, 0, 50)
+    fullButton.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+    fullButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    fullButton.Font = Enum.Font.GothamBold
+    fullButton.TextSize = 14
+    fullButton.Text = "Copy FULL Log (F6)"
+    fullButton.Active = true
+    fullButton.Draggable = true
+    fullButton.Parent = gui
+
+    local fullCorner = Instance.new("UICorner")
+    fullCorner.CornerRadius = UDim.new(0, 6)
+    fullCorner.Parent = fullButton
+
     local resetLabelAt = 0
+    local fullResetLabelAt = 0
 
     local function copyLogs()
         local text = table.concat(logBuffer, "\n")
@@ -215,16 +275,50 @@ do
         end)
     end
 
+    local function copyFullLog()
+        if not hasFileApi then
+            fullButton.Text = "No file API"
+            warn("[LOG-COPY] writefile/appendfile unavailable in this executor - cannot read full session log")
+        elseif type(setClip) ~= "function" then
+            fullButton.Text = "No clipboard API"
+        else
+            local ok, content = pcall(readfile, LOG_FILE)
+            if ok and content then
+                local clipOk = pcall(setClip, content)
+                local lineCount = select(2, content:gsub("\n", "\n")) + 1
+                fullButton.Text = clipOk and ("Copied! (~" .. lineCount .. " lines)") or "Copy failed"
+                if not clipOk then
+                    warn("[LOG-COPY] setclipboard call threw an error for full log")
+                end
+            else
+                fullButton.Text = "Read failed"
+                warn("[LOG-COPY] Could not read " .. LOG_FILE .. ": " .. tostring(content))
+            end
+        end
+
+        local myResetToken = tick()
+        fullResetLabelAt = myResetToken
+        task.delay(2, function()
+            if fullResetLabelAt == myResetToken and fullButton and fullButton.Parent then
+                fullButton.Text = "Copy FULL Log (F6)"
+            end
+        end)
+    end
+
     button.MouseButton1Click:Connect(copyLogs)
+    fullButton.MouseButton1Click:Connect(copyFullLog)
 
     userInputService.InputBegan:Connect(function(input, gameProcessedEvent)
         if gameProcessedEvent then return end
         if input.KeyCode == Enum.KeyCode.F5 then
             copyLogs()
+        elseif input.KeyCode == Enum.KeyCode.F6 then
+            copyFullLog()
         end
     end)
 
-    print("[LOG-COPY] Ready - click the 'Copy Logs' button (top-right, draggable) or press F5 to copy the whole console to your clipboard")
+    print("[LOG-COPY] Ready - F5 copies the recent in-memory log (~" .. LOG_BUFFER_MAX .. " lines), F6 copies the COMPLETE session log from disk (never drops older lines, use this for anything that happened a while ago)" ..
+        (hasFileApi and "" or " [F6 unavailable: no writefile/appendfile in this executor]"))
 end
 
 -- ============================================================
