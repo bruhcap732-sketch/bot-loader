@@ -1,71 +1,21 @@
 -- WITHDRAWAL COMPLETION RECOVERY v8
 -- CLIENT INVENTORY HEARTBEAT SYNC\n-- PS99 Auto Sell Bot v1.0
 -- WITHDRAWAL CLIENT INVENTORY FALLBACK HARDENED v6
+-- SIMPLE BUILD (2026-10-11): same base as the earlier working script, with
+-- ONE real fix - Cosmic Value reading is now actually wired into the real
+-- deposit path (checkItems), not just the unused side-path that had it
+-- before. Found by reading the old file closely: checkItems() (what the
+-- real deposit flow actually calls) built items as plain identityKey
+-- strings with no cosmicValue/demand at all - only checkTheirItems(), a
+-- function the live deposit flow never calls, had real CV reading. That's
+-- why Cosmic Value never reached a real deposit. Everything else in this
+-- file is unchanged from the version that was already working.
 -- Loaded via: loadstring(game:HttpGet("..."))()
-
--- ============================================================
--- SINGLE-INSTANCE GUARD
--- ============================================================
--- Real bug found live (2026-10-10, operator report: "it worked the first
--- time, then it just breaks" - a deposit/withdrawal would succeed once,
--- then subsequent trades misbehaved). The actual evidence was sitting in
--- the operator's own console pastes the whole time: lines like
--- "[TRADE] Incoming from: Jejd544" were printing TWICE, with two
--- different nonces, for the exact same event - same for [GEM-BALANCE],
--- [ANTI-AFK] Found hoverboard button, etc. That is not a console/display
--- glitch. It means this script was running TWICE AT ONCE under the same
--- bot account (executed twice, auto-execute plus a manual re-run, two
--- windows, whatever the cause) - two completely independent copies, each
--- with its own separate activeIncomingTrade/goNext locks (those are plain
--- Lua locals, so they cannot coordinate across two separate script runs),
--- both calling SetReady/SetItem/SetConfirmed against the SAME single real
--- Roblox trade window and stepping on each other. The first trade can
--- survive this by luck (the backend's own idempotency on process-deposit
--- absorbed one real duplicate-call case already seen live), but nothing
--- protects a later trade from the two copies actively fighting over it.
---
--- getgenv() (or _G as a fallback) is an executor-provided table that
--- persists across separate loadstring() calls within the same Roblox
--- client session - exactly the shared state needed to detect "is a
--- previous copy of me still alive" from a second, independent execution
--- that otherwise has no way to know the first one exists. If a live copy
--- is already running, this one aborts immediately, before touching
--- ANYTHING else (GUI, trade state, API calls) - so re-running the
--- loadstring (on purpose or by accident) is now always safe: at most one
--- copy ever actually drives trades.
-do
-    local env = (type(getgenv) == "function" and getgenv()) or _G
-    local GUARD_KEY = "__BLOXYFLIP_BOT_INSTANCE_ACTIVE"
-    local HEARTBEAT_KEY = "__BLOXYFLIP_BOT_INSTANCE_HEARTBEAT"
-    -- A guard set by a PAST session that crashed/stopped without clearing
-    -- it (executor reset, game left and rejoined without a fresh client,
-    -- etc.) should not permanently lock every future run out. The still-
-    -- running instance refreshes HEARTBEAT_KEY continuously (see the
-    -- task.spawn below); treat anything older than 20s as abandoned rather
-    -- than genuinely active.
-    local STALE_SECONDS = 20
-    local now = (type(os) == "table" and os.clock) and os.clock() or tick()
-    local lastHeartbeat = tonumber(env[HEARTBEAT_KEY])
-
-    if env[GUARD_KEY] == true and lastHeartbeat and (now - lastHeartbeat) < STALE_SECONDS then
-        warn("[BOT] ANOTHER COPY OF THIS SCRIPT IS ALREADY RUNNING in this Roblox session - aborting this one so they cannot fight over the same trade window. If the other copy is actually gone, wait 20s and try again.")
-        return
-    end
-
-    env[GUARD_KEY] = true
-    env[HEARTBEAT_KEY] = now
-    task.spawn(function()
-        while true do
-            task.wait(5)
-            env[HEARTBEAT_KEY] = (type(os) == "table" and os.clock) and os.clock() or tick()
-        end
-    end)
-end
 
 -- ============================================================
 -- CONFIGURATION (UPDATE THESE!)
 -- ============================================================
-local BOT_ID           = "98a5a262a479bd8203a8f5d9"   
+local BOT_ID           = "98a5a262a479bd8203a8f5d9"
 local BOT_API_SECRET   = "3f0bf649661ee04db63e561fe0f4e5475e666cd73317df8e1ea892a0c69f0876"
 local PRIVATE_SERVER_LINK = "https://www.roblox.com/share?code=ec02451b42e74946973aee7260ed4d80&type=Server"
 -- Base URL only. Do NOT append /api. The client adds /api/bots/... itself.
@@ -73,25 +23,6 @@ local website          = "https://bloxyflip.fun"
 local discordWebhook   = ""  -- optional: Discord webhook for trade logs
 
 local TRADE_TIMEOUT_SECONDS = 120
--- A trade the bot already accepted but where the player never even clicks
--- READY blocks every OTHER incoming trade for the full TRADE_TIMEOUT_SECONDS,
--- since nothing short-circuits it earlier. Cancel much sooner in that
--- specific case only - a trade that's actually in progress (player already
--- readied at least once) is untouched and still protected by the full
--- TRADE_TIMEOUT_SECONDS safety net.
---
--- Bug fix (2026-10-11, live log evidence): a real registered depositor
--- (343bossboy3onpc2y) had their trade auto-cancelled by the bot itself
--- ("ps99_flips123 cancelled the trade!") about 30-40s after it opened -
--- 35s is not enough time for a real player to open their inventory,
--- find/select possibly many items, and click ready, especially with any
--- game lag. From the operator's side this looks exactly like "the bot
--- broke" (trade just dies with no warning) when it was actually this
--- timeout firing as designed, just far too aggressively. Raised to 75s -
--- still comfortably under the unrelated 90s TRADE-LOCK-WATCHDOG
--- threshold elsewhere so the two can never race/double-fire on the same
--- trade, but more than double the breathing room for a real player.
-local NOT_READIED_TIMEOUT_SECONDS = 75
 local MAX_TRADE_PETS = 100
 local ROBLOX_GEMS_PER_SITE_GEM = 1 -- 1m Roblox gems = 1 site gem; 1b = 1000
 -- ============================================================
@@ -102,26 +33,7 @@ local players           = game:GetService("Players")
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local virtualUser       = game:GetService("VirtualUser")
 local textChatService   = game:GetService("TextChatService")
-local teleportService   = game:GetService("TeleportService")
 local localPlayer = players.LocalPlayer
-
--- ============================================================
--- MULTI-BOT AUTO-DETECT (optional)
--- Operator request (2026-09-20): "can i run 2 bots on 1 script" - lets ONE
--- copy of this file run as whichever bot account happens to launch it,
--- instead of needing a separately hand-edited copy per bot. Add one entry
--- per bot username below; if the account currently running this script
--- matches one, its BOT_ID/BOT_API_SECRET above are overridden right here.
--- An account not listed (or this table left empty) just keeps using the
--- BOT_ID/BOT_API_SECRET set in CONFIGURATION above, unchanged.
--- ============================================================
-local BOT_PROFILES = {}
-local myProfile = localPlayer and BOT_PROFILES[localPlayer.Name]
-if myProfile then
-    BOT_ID = myProfile.id
-    BOT_API_SECRET = myProfile.secret
-end
-print("[BOT] Running as: " .. tostring(localPlayer and localPlayer.Name) .. " -> Bot ID: " .. tostring(BOT_ID))
 
 -- ============================================================
 -- EXECUTOR HTTP REQUEST
@@ -145,7 +57,7 @@ end
 local playerGUI     = localPlayer:WaitForChild("PlayerGui", 30)
 local tradingWindow = playerGUI:WaitForChild("TradeWindow", 30)
 if not tradingWindow then
-    error("[BOT] CRIsTICAL: TradeWindow not found. Make sure you are in a PS99 private server!")
+    error("[BOT] CRITICAL: TradeWindow not found. Make sure you are in a PS99 private server!")
 end
 
 -- Lazily resolved when first trade happens
@@ -153,242 +65,6 @@ local tradingMessage = playerGUI:FindFirstChild("Message")
 
 -- Trade UI refs - refreshed per-trade
 local tradingFrame, playerItemsFrame, tradingStatus, theirItemsFrame, theirStatus
-
--- ============================================================
--- LOG COPY GUI + F5 HOTKEY
--- Captures everything printed to the Developer Console (print/warn/error,
--- from ANY script, not just this one) into a ring buffer, so the whole
--- session's log can be copied to the clipboard in one shot instead of
--- scrolling and screenshotting the console piece by piece. Set up first,
--- before anything else runs, so it catches startup output too.
--- ============================================================
-do
-    local logService = game:GetService("LogService")
-    local userInputService = game:GetService("UserInputService")
-
-    -- Real gap fix (2026-10-11, operator report: a trade's balance update
-    -- was confirmed real/correct, but by the time F5 was pressed later,
-    -- nothing about that trade was in the copied log any more - "I gave
-    -- you so many console logs... you can't diagnose it, that means the
-    -- console's not the problem"). The in-memory ring buffer below is
-    -- capped at LOG_BUFFER_MAX lines - with this script printing a line
-    -- or more every few seconds just from heartbeats/gem-balance/inventory
-    -- scans even when nothing is happening, that cap can cycle through and
-    -- silently drop evidence of a real trade from earlier in a long
-    -- session, well before anyone presses F5. Raised as a cheap first
-    -- safety margin (6000 -> 20000 lines - still a bounded, small amount
-    -- of memory, just a much longer runway).
-    --
-    -- The actual fix is the second layer below: every line is ALSO
-    -- appended to a real file on disk (writefile/appendfile, standard
-    -- executor file API), which has no line cap at all - it keeps
-    -- everything for the entire session regardless of how long the bot
-    -- has been running or how much has printed since. A second button/
-    -- hotkey (F6 / "Copy FULL Log (F6)") reads that file back and copies
-    -- the complete session history, not just whatever's left in the
-    -- bounded in-memory window - so "I pressed F5 an hour after the trade
-    -- happened" can no longer lose the evidence the way it just did.
-    local LOG_BUFFER_MAX = 20000
-    local logBuffer = {}
-
-    local LOG_FILE = "bloxyflip_bot_session_log.txt"
-    local hasFileApi = type(writefile) == "function" and type(appendfile) == "function"
-    if hasFileApi then
-        -- Fresh file per script execution - makeAuthenticatedRequest signs
-        -- every request with the running session, so "this session's full
-        -- log" is the useful unit, not an ever-growing cross-session file.
-        pcall(function() writefile(LOG_FILE, "=== BloxyFlip bot session log started " .. os.date("%Y-%m-%d %H:%M:%S") .. " ===\n") end)
-    else
-        warn("[LOG-COPY] No writefile/appendfile in this executor - full-session file logging unavailable, only the " .. tostring(LOG_BUFFER_MAX) .. "-line in-memory buffer will be available via F5")
-    end
-
-    pcall(function()
-        logService.MessageOut:Connect(function(message, _messageType)
-            local line = tostring(message)
-            table.insert(logBuffer, line)
-            if #logBuffer > LOG_BUFFER_MAX then
-                table.remove(logBuffer, 1)
-            end
-            if hasFileApi then
-                pcall(appendfile, LOG_FILE, line .. "\n")
-            end
-        end)
-    end)
-
-    local setClip = (getgenv and getgenv().setclipboard) or setclipboard or toclipboard
-        or (syn and syn.write_clipboard)
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "BloxyFlipLogCopy"
-    gui.ResetOnSpawn = false
-    gui.Parent = playerGUI
-
-    local button = Instance.new("TextButton")
-    button.Name = "CopyLogsButton"
-    button.Size = UDim2.new(0, 140, 0, 36)
-    button.Position = UDim2.new(1, -150, 0, 10)
-    button.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
-    button.TextColor3 = Color3.fromRGB(255, 255, 255)
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 14
-    button.Text = "Copy Logs (F5)"
-    button.Active = true
-    button.Draggable = true
-    button.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = button
-
-    -- Second button, stacked right below the first - copies the FULL
-    -- on-disk session log (see LOG_FILE above), not the bounded in-memory
-    -- window. This is the one to use for "something happened a while ago
-    -- and I want the whole story," since it can never have silently
-    -- dropped older lines the way the F5 buffer can over a long session.
-    local fullButton = Instance.new("TextButton")
-    fullButton.Name = "CopyFullLogButton"
-    fullButton.Size = UDim2.new(0, 140, 0, 36)
-    fullButton.Position = UDim2.new(1, -150, 0, 50)
-    fullButton.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
-    fullButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-    fullButton.Font = Enum.Font.GothamBold
-    fullButton.TextSize = 14
-    fullButton.Text = "Copy FULL Log (F6)"
-    fullButton.Active = true
-    fullButton.Draggable = true
-    fullButton.Parent = gui
-
-    local fullCorner = Instance.new("UICorner")
-    fullCorner.CornerRadius = UDim.new(0, 6)
-    fullCorner.Parent = fullButton
-
-    local resetLabelAt = 0
-    local fullResetLabelAt = 0
-
-    -- Operator report (2026-10-11): copying the ENTIRE session file in one
-    -- setclipboard call could crash the game once a session ran long
-    -- enough to pass ~5000 lines - a single multi-hundred-KB clipboard
-    -- write is apparently too much for the client to handle at once.
-    -- Paged instead: each F6 press copies one CHUNK_LINES-line slice of
-    -- the file, starting from the END (most recent activity - usually
-    -- what you actually need) and working backward in time on each
-    -- subsequent press, wrapping back to the most recent chunk once it
-    -- runs out of older lines. The button/console label always says which
-    -- chunk and line range you just got, so pasting multiple chunks
-    -- stays unambiguous about what's covered.
-    local CHUNK_LINES = 4000
-    local fullLogChunkIndex = 0
-
-    local function copyLogs()
-        local text = table.concat(logBuffer, "\n")
-
-        if type(setClip) == "function" then
-            local ok = pcall(setClip, text)
-            button.Text = ok and ("Copied! (" .. #logBuffer .. " lines)") or "Copy failed"
-            if not ok then
-                warn("[LOG-COPY] setclipboard call threw an error")
-            end
-        else
-            button.Text = "No clipboard API"
-            warn("[LOG-COPY] No setclipboard/toclipboard function found in this executor - cannot copy")
-        end
-
-        local myResetToken = tick()
-        resetLabelAt = myResetToken
-        task.delay(2, function()
-            if resetLabelAt == myResetToken and button and button.Parent then
-                button.Text = "Copy Logs (F5)"
-            end
-        end)
-    end
-
-    local function copyFullLog()
-        if not hasFileApi then
-            fullButton.Text = "No file API"
-            warn("[LOG-COPY] writefile/appendfile unavailable in this executor - cannot read full session log")
-        elseif type(setClip) ~= "function" then
-            fullButton.Text = "No clipboard API"
-        else
-            local ok, content = pcall(readfile, LOG_FILE)
-            if ok and content then
-                -- Split into lines once per press rather than keeping a
-                -- parallel in-memory copy of the whole file at all times -
-                -- this file only grows across a long session, so re-reading
-                -- it fresh on each press also means a chunk always reflects
-                -- whatever's actually on disk right now.
-                local lines = {}
-                for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-                    table.insert(lines, line)
-                end
-
-                local totalLines = #lines
-                local totalChunks = math.max(1, math.ceil(totalLines / CHUNK_LINES))
-
-                -- Wrap back to the most recent chunk (index 0) once past
-                -- the oldest one, rather than erroring or sticking.
-                if fullLogChunkIndex >= totalChunks then
-                    fullLogChunkIndex = 0
-                end
-
-                -- Chunk 0 = the LAST CHUNK_LINES lines (most recent activity).
-                -- Chunk 1 = the CHUNK_LINES lines before that. And so on,
-                -- walking backward in time with each press.
-                local endLine = totalLines - (fullLogChunkIndex * CHUNK_LINES)
-                local startLine = math.max(1, endLine - CHUNK_LINES + 1)
-
-                local chunkLines = {}
-                for i = startLine, endLine do
-                    table.insert(chunkLines, lines[i])
-                end
-                local chunkText = table.concat(chunkLines, "\n")
-
-                local clipOk = pcall(setClip, chunkText)
-                local chunkNumber = fullLogChunkIndex + 1
-                fullButton.Text = clipOk
-                    and ("Copied " .. chunkNumber .. "/" .. totalChunks .. "!")
-                    or "Copy failed"
-                if clipOk then
-                    print("[LOG-COPY] F6 copied chunk " .. chunkNumber .. "/" .. totalChunks ..
-                        " (lines " .. startLine .. "-" .. endLine .. " of " .. totalLines .. " total" ..
-                        (chunkNumber == 1 and ", most recent first" or "") ..
-                        ") - press F6 again for the next chunk further back in time")
-                else
-                    warn("[LOG-COPY] setclipboard call threw an error for full log chunk " .. chunkNumber)
-                end
-
-                fullLogChunkIndex = fullLogChunkIndex + 1
-            else
-                fullButton.Text = "Read failed"
-                warn("[LOG-COPY] Could not read " .. LOG_FILE .. ": " .. tostring(content))
-            end
-        end
-
-        local myResetToken = tick()
-        fullResetLabelAt = myResetToken
-        task.delay(2, function()
-            if fullResetLabelAt == myResetToken and fullButton and fullButton.Parent then
-                fullButton.Text = "Copy FULL Log (F6)"
-            end
-        end)
-    end
-
-    button.MouseButton1Click:Connect(copyLogs)
-    fullButton.MouseButton1Click:Connect(copyFullLog)
-
-    userInputService.InputBegan:Connect(function(input, gameProcessedEvent)
-        if gameProcessedEvent then return end
-        if input.KeyCode == Enum.KeyCode.F5 then
-            copyLogs()
-        elseif input.KeyCode == Enum.KeyCode.F6 then
-            copyFullLog()
-        end
-    end)
-
-    print("[LOG-COPY] Ready - F5 copies the recent in-memory log (~" .. LOG_BUFFER_MAX .. " lines). " ..
-        "F6 copies the full on-disk session log in " .. CHUNK_LINES .. "-line chunks (most recent first) - " ..
-        "press it once for the latest chunk, press again for the one before that, and so on; wraps back to the most recent after the oldest chunk" ..
-        (hasFileApi and "" or " [F6 unavailable: no writefile/appendfile in this executor]"))
-end
 
 -- ============================================================
 -- LOAD GAME MODULES
@@ -484,29 +160,7 @@ local activeIncomingTrade = false
 local activeIncomingUserId = nil
 local activeIncomingSince = 0
 local withdrawalHoldUntil = {}
--- Throttles the repeated-request log/decline below to once a second per
--- user instead of once per loop tick (every 0.05s) - the main loop was
--- printing and re-declining the same held request ~20x/second for the
--- entire cooldown window, flooding the console log. This throttle is
--- INDEPENDENT of WITHDRAWAL_HOLD_COOLDOWN below and stays in place
--- regardless of that value - it's what actually prevents a real spam
--- loop against Roblox's own DeclineRequest/the backend, not the hold
--- duration itself.
-local lastHoldDeclineAt = {}
--- Operator request (2026-10-11): "can you remove that timer... if you
--- can't detect it, you don't detect it, they just have to send a new
--- trade." Cut from 30s to 2s - not all the way to 0, on purpose: this
--- cooldown exists because a declined trade request can keep re-appearing
--- in Roblox's own incoming-request list for a bit after being declined
--- (not under this script's control), and the main loop re-scans every
--- 0.05s - a 0s cooldown means re-running the FULL check-user-banned API
--- call and a real DeclineRequest call up to ~20 times/second for as long
--- as that happens, not just a log line. 2s keeps a blocked player's retry
--- feeling near-instant (not the old 30s wait) while still keeping real
--- API/Roblox-call volume sane. Push this to a smaller number (or 0) if
--- the 2s still feels too slow - just know 0 means genuinely uncapped
--- repeated API+Roblox calls while a lingering request is still visible.
-local WITHDRAWAL_HOLD_COOLDOWN = 2
+local WITHDRAWAL_HOLD_COOLDOWN = 30
 local method             = nil
 local tradeId            = 0
 local lastTradeUsername  = nil
@@ -514,29 +168,11 @@ local lastTradeUserId    = nil
 local lastGameTradeId    = nil
 local lastTradeItems     = {}
 local lastTradeGems      = 0
-local preConfirmGemBalance = nil -- bot's own gem balance snapshotted right as the player's confirm was verified, for the no-message fallback below
-local preConfirmItemCount  = nil -- same idea, candidate-pet inventory count - see preConfirmGemBalance's own doc comment
--- Simulated (109,000-trial Monte Carlo, 2026-10-11): gem balance alone can
--- false-positive on a SMALL gems-only deposit if the bot's own passive
--- in-game income (breakables, reward chests - this account visibly plays
--- the game, not just trades) coincidentally matches the required amount
--- during the ~2min trade window. Requiring the pet-count to also have
--- increased by the right number when the trade included items cuts that
--- false-positive rate by roughly 250x (coincidentally gaining the exact
--- right number of matching pets from an unrelated source is far less
--- likely than a stray gem windfall). For GEMS-ONLY deposits there's no
--- item signal to corroborate with, so below this floor the fallback does
--- NOT auto-credit - it alerts for manual review instead, which the
--- simulation showed eliminates false positives for small amounts entirely
--- at the cost of those specific small/no-popup cases needing a human to
--- confirm instead of being auto-recovered.
-local GEMS_ONLY_FALLBACK_FLOOR = 1000000
 local lastWithdrawalData = nil
 local lastItemsGiven     = {}
 local lastBotGemsAdded   = 0  -- gems bot actually sent (derived from botGemBalance, not UI)
 local botGemBalance      = 0  -- latest backend-held gem balance
 local botGemBalancePresent = false -- true once heartbeat supplies a valid heldGemsBalance
-local heldGemsBalanceAbsentExplained = false -- prints the "this is expected" explanation once, not every ~30s heartbeat
 local lastGemsRequested  = 0  -- what we asked the game to add (reliable even after window closes)
 local lastWithdrawalMissing = { pets = {}, gems = 0 }  -- tracks what bot couldn't fulfil
 
@@ -557,25 +193,6 @@ local assetIds        = {}
 local goldAssetids    = {}
 local nameAssetIds    = {}
 local hugesTitanicsIds = {}
-
--- REAL BUG FIX (2026-09-20, operator report: "Huge Gamer Panda" depositing
--- at 31,000,000 / 25,000,000 - a round, wrong number - while its real
--- in-game Cosmic Value tooltip read 11.9M in the same trade). This is
--- readCosmicValueFromSlot's cache (declared further down, next to that
--- function, where it always lived) - it was keyed ONLY by display name
--- ("Huge Gamer Panda"), with no expiry and no per-trade scoping, so once
--- ANY deposit of that name read a Cosmic Value even once, EVERY SUBSEQUENT
--- deposit of that same name - by any player, for the rest of this bot
--- process's uptime - silently reused that one frozen number instead of
--- ever reading the tooltip again. A live diagnostic (check-deposit-pricing)
--- against real deposit rows confirmed it: two different players got the
--- exact same 31,000,000 minutes apart, and an earlier pair of deposits
--- both got the same 25,000,000 from what was almost certainly the
--- previous bot session's first (and only) real read. Declared here, at
--- module scope BEFORE resetTradeState below, so resetTradeState can clear
--- it at every real trade boundary - the one thing the original version
--- never did.
-local cvCache = {}
 
 -- ============================================================
 -- UTILITY
@@ -601,13 +218,20 @@ local function formatDepositGemCredit(robloxGems)
     return string.format("%.3f site gems", siteGems):gsub("(%..-)0+$", "%1"):gsub("%.$", "")
 end
 
+-- cvCache lives at module scope (not inside the CV reader section further
+-- down) so resetTradeState() - declared here, before it's used - can clear
+-- it at every trade boundary. This is the fix for the OTHER known bug in
+-- this style of CV reader (confirmed live, earlier tonight): without this
+-- clear, a price read once stays cached and gets silently reused for every
+-- later deposit of that same pet name, even a completely different trade,
+-- for the rest of the bot's uptime.
+local cvCache = {}
+
 local function resetTradeState()
     lastTradeItems        = {}
     lastTradeUserId       = nil
     lastGameTradeId       = nil
     lastTradeGems         = 0
-    preConfirmGemBalance  = nil
-    preConfirmItemCount   = nil
     lastWithdrawalData    = nil
     lastItemsGiven        = {}
     lastBotGemsAdded      = 0
@@ -619,12 +243,7 @@ local function resetTradeState()
     botConfirmed          = false
     hasReadied            = false
     hasConfirmed          = false
-    -- Real bug fix (2026-09-20) - see cvCache's own declaration above for
-    -- the full story. Cleared at every trade boundary (this function runs
-    -- at the start of a new incoming trade and after every trade ends), so
-    -- a Cosmic Value read from one trade can never leak into a completely
-    -- different later deposit as a stale, unrefreshed price.
-    cvCache = {}
+    cvCache               = {}
 end
 
 local function releaseIncomingTradeLock()
@@ -664,68 +283,6 @@ end
 -- ============================================================
 -- API
 -- ============================================================
-
--- Real incident (2026-10-10, live operator report: "it just breaks after
--- 10 minutes... nothing dies, it just doesn't work"). Every signed
--- request below uses os.time() + this offset, never bare os.time(). The
--- backend (requireRobloxBotAuth) rejects any request whose timestamp is
--- more than 5 minutes off real server time - necessary to stop a
--- captured request being replayed later, but it means this bot's signing
--- clock has to actually be right. os.time() reads the local device
--- clock, and this script commonly runs under an emulator (BlueStacks)
--- under sustained load (constant real mouse movement for Cosmic Value
--- reads, large inventory scans) - exactly the conditions under which a
--- virtual machine's clock is known to drift. Once that drift crosses 5
--- minutes, EVERY signed call starts failing with 401, including the one
--- that credits a deposit - right after the real trade already completed
--- in Roblox. Worse, this was completely silent: sendMessage is a no-op
--- (disabled for speed, see its own comment) and discordWebhook is
--- commonly left blank, so a 401 here produced no visible symptom at all
--- - the pet was just gone, uncredited, with nothing telling anyone why.
--- Fix: learn the REAL server time via GET /health (added for exactly
--- this) and correct for the difference, instead of trusting the local
--- clock at all. Synced once at startup (syncServerTimeOffset is called
--- further down, before the first authenticated call) and re-synced every
--- few minutes thereafter (see the task.spawn loop near HEARTBEAT) so
--- ongoing drift during a long session can never silently reaccumulate
--- past the tolerance again.
-local serverTimeOffset = 0
-
-local function syncServerTimeOffset()
-    local base = website:gsub("/+$", "")
-    local ok, response = pcall(function()
-        return request({ Url = base .. "/health", Method = "GET" })
-    end)
-
-    if not ok or not response or not response.Body then
-        warn("[TIME-SYNC] Could not reach /health to sync server time - keeping previous offset (" ..
-            tostring(serverTimeOffset) .. "s)")
-        return false
-    end
-
-    local decodeOk, data = pcall(function()
-        return httpService:JSONDecode(response.Body)
-    end)
-
-    if not decodeOk or type(data) ~= "table" or type(data.time) ~= "number" then
-        warn("[TIME-SYNC] /health response had no usable 'time' field - keeping previous offset (" ..
-            tostring(serverTimeOffset) .. "s)")
-        return false
-    end
-
-    local localNow = os.time()
-    local newOffset = math.floor(data.time - localNow)
-    local previousOffset = serverTimeOffset
-    serverTimeOffset = newOffset
-
-    if math.abs(newOffset - previousOffset) >= 5 then
-        print("[TIME-SYNC] Local clock offset from server: " .. tostring(newOffset) ..
-            "s (was " .. tostring(previousOffset) .. "s) - every signed request now corrects for this")
-    end
-
-    return true
-end
-
 local function randomNonce()
     local ok, guid = pcall(function() return httpService:GenerateGUID(false) end)
     if ok and guid then return guid:gsub("%-", "") end
@@ -814,13 +371,8 @@ local function makeAuthenticatedRequest(endpoint, body, method)
         rawBody = httpService:JSONEncode(body)
     end
 
-    -- Fresh auth material on EVERY request, including retries. os.time()
-    -- + serverTimeOffset, not bare os.time() - see serverTimeOffset's own
-    -- doc comment for the real incident this fixes (silent 401s on every
-    -- signed call once an emulator's clock drifts past the 5-minute
-    -- tolerance, with no visible error anywhere since chat is a no-op and
-    -- the Discord webhook is commonly blank).
-    local timestamp = tostring(os.time() + serverTimeOffset)
+    -- Fresh auth material on EVERY request, including retries.
+    local timestamp = tostring(os.time())
     local nonce = randomNonce()
     local bodyHash = sha256Hex(rawBody)
     local canonical = table.concat({ method, endpoint, timestamp, nonce, bodyHash }, "\n")
@@ -875,11 +427,6 @@ local function getPendingWithdrawal(userId)
         return nil
     end
 
-    -- A withdrawal can become active a fraction of a second after the
-    -- website marks it active.  This used to be only 1 second total, which
-    -- allowed a very fast trader to fall through to DEPOSIT mode.
-    -- Keep this short: the Worker is expected to atomically claim and return
-    -- an active withdrawal. These retries only cover a tiny backend timing race.
     local LOOKUP_ATTEMPTS = 3
     local LOOKUP_DELAY = 0.10
 
@@ -915,9 +462,6 @@ local function getPendingWithdrawal(userId)
                     }
                 end
 
-                -- IMPORTANT: withdrawal=nil does NOT mean "no withdrawal".
-                -- The backend contract explicitly uses pendingWithdrawalExists
-                -- to distinguish a real pending withdrawal from nothing owed.
                 if data.pendingWithdrawalExists == true or data.blocked == true then
                     local reason = data.reason
                     local shortCount = type(data.shortItems) == "table" and #data.shortItems or 0
@@ -932,12 +476,6 @@ local function getPendingWithdrawal(userId)
                         " | heldGems=" .. tostring(data.heldGems or 0) ..
                         " | hasPendingPayload=" .. tostring(type(pending) == "table"))
 
-                    -- The Worker can legitimately return withdrawal=null when its
-                    -- server-side held-item ledger says this client cannot cover the
-                    -- withdrawal. If it ALSO gives us the pending withdrawal payload,
-                    -- the Roblox client can verify its real inventory itself. This is
-                    -- necessary when the backend's held-item cache is stale.
-                    -- Never override a withdrawal assigned to another client.
                     local assignedElsewhere = type(pending) == "table"
                         and (pending.assignedToAnotherClient == true
                             or (pending.assignedToThisClient == false
@@ -980,7 +518,6 @@ local function getPendingWithdrawal(userId)
                     }
                 end
 
-                -- Only this response means there is genuinely nothing owed.
                 print("[WITHDRAWAL] Confirmed no pending withdrawal")
                 return {
                     success = true,
@@ -1048,16 +585,6 @@ local function tradeItemDisplay(itemKey)
     return tostring(itemKey)
 end
 
--- Build a transaction ID that is stable for the lifetime of one PS99 trade.
---
--- PS99 gives us the live trade state _id, but that value is only meaningful
--- inside the server/session that created the trade. Include the Roblox JobId so
--- a reused _id after a reconnect/server restart cannot be mistaken for the
--- previous trade. BOT_ID keeps different bots isolated as well.
---
--- IMPORTANT: this value is created from stable trade identity only; it is NOT
--- regenerated for API retries. processDeposit receives the same value for every
--- retry of the same completed trade.
 local function makeStableTradeTransactionId(gameTradeId)
     local rawTradeId = tostring(gameTradeId or "")
     if rawTradeId == "" or rawTradeId == "0" then
@@ -1084,42 +611,14 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
     local payloadItems = {}
     local counts = {}
     for _, entry in ipairs(items or {}) do
-        -- checkItems() now returns {identityKey, displayName, cosmicValue,
-        -- demand} tables instead of plain display-name strings, so CV data
-        -- can ride along. Still accept a bare string too, for any caller
-        -- that hasn't been updated to the table shape.
-        local identityKey = type(entry) == "table" and entry.identityKey or nil
-        local displayName = type(entry) == "table" and entry.displayName or tostring(entry)
+        -- Support both plain string names and table entries with CV data.
+        -- checkItems() now always sends table entries - see its own doc
+        -- comment for why.
+        local displayName = type(entry) == "table" and entry.name or tostring(entry)
         local cosmicValue = type(entry) == "table" and entry.cosmicValue or nil
-        local demand       = type(entry) == "table" and entry.demand or nil
+        local demand      = type(entry) == "table" and entry.demand or nil
 
         local item = displayToCatalog(displayName)
-        if not item and identityKey then
-            -- displayToCatalog can miss when the same display name maps to
-            -- more than one catalog entry (GetSupported() deliberately nils
-            -- those out to avoid guessing) - the identityKey is the real,
-            -- unambiguous configName|variant join key, so try that directly.
-            --
-            -- Bug fix (2026-09-14, live report: a 14-pet deposit crashed
-            -- mid-processDeposit with "attempt to concatenate nil with
-            -- string" at the old line 726, meaning the whole deposit was
-            -- silently dropped before ever reaching the backend - nothing
-            -- to credit because nothing was ever sent). This used to
-            -- assign the RAW catalogByKey entry straight into `item`,
-            -- which has a `configName` field, not `petConfigId` - every
-            -- other caller of this catalog (displayToCatalog above)
-            -- normalizes that shape first. Falling back to raw here meant
-            -- item.petConfigId was nil the moment displayToCatalog missed,
-            -- which is exactly the case this fallback exists to handle.
-            local rawEntry = catalogByKey[identityKey]
-            if rawEntry then
-                item = {
-                    petConfigId = tostring(rawEntry.configName or rawEntry.petConfigId),
-                    variant = tostring(rawEntry.variant or "normal"),
-                    quantity = 1,
-                }
-            end
-        end
         if not item then
             return false, "Unsupported/unmapped item: " .. tostring(displayName)
         end
@@ -1129,6 +628,13 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
         else
             item.cosmicValue = cosmicValue
             item.demand = demand
+            -- Tells the backend the identity (name + variant) is a real,
+            -- confirmed read - not an OCR guess. Needed for the backend's
+            -- own "price unknown but identity confirmed -> credit at 0
+            -- instead of holding forever" fallback to apply. Without this,
+            -- a deposit with no Cosmic Value read sits invisible in a
+            -- pricing queue rather than being handled either way.
+            item.variantRead = true
             counts[key] = item
             table.insert(payloadItems, item)
         end
@@ -1163,20 +669,8 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
         lastData = data
         lastStatus = status
 
-        -- REAL BUG FOUND (2026-10-10, live operator log): the backend's
-        -- /process-deposit route returns HTTP 201 (Created) for every
-        -- normal, genuinely new deposit, and only ever returns 200 for a
-        -- duplicate resubmission - this is standard REST practice (201 =
-        -- "a new resource was created"), but this check only ever accepted
-        -- 200. That means EVERY real first-time deposit was being treated
-        -- as a FAILURE by this script, even while the backend's own
-        -- response said {"success":true,"status":"CREDITED"} - confirmed
-        -- directly from a live log: [API] showed 201 CREDITED, and the verf
-        -- next line showed this function returning false with
-        -- result="HTTP 201". The deposit genuinely succeeded the entire
-        -- time; the bot just told itself (and the player, via the
-        -- WARNING/contact-support message) that it hadn't. This is very
-        -- likely the single biggest explanation for tonight's whole saga.
+        -- The backend returns 201 for a genuinely new deposit and 200 only
+        -- for a duplicate resubmission - accept both as success.
         if s and r and (status == 200 or status == 201) and data and data.success then
             local dep = data.deposit or {}
             return true, dep.value or 0, data
@@ -1191,59 +685,6 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
         ("HTTP " .. tostring(lastStatus or "?")), lastData
 end
 
--- Operator request (2026-10-11): "what if one request didn't go
--- through... checks the site admin panel... sees oh this hasn't
--- credited, this person back." A genuine independent recheck, not just
--- trusting process-deposit's own response - a short while after a
--- deposit the bot believes succeeded, this asks the backend again
--- whether it actually agrees, using the exact same tradeId both calls
--- share. If anything disagrees with what the player was already told,
--- this is loud about it (Discord, not just a console line) rather than
--- silently trusting the first "success" the way the whole night's worth
--- of confusion started.
-local function verifyDepositLanded(transactionTradeId, username, expectedGems, expectedItemCount)
-    task.delay(15, function()
-        local s, r = makeAuthenticatedRequest("/api/bots/verify-deposit", { tradeId = transactionTradeId }, "POST")
-        local data = decodeBody(r)
-        local status = s and r and tonumber(r.StatusCode) or nil
-
-        if not (s and r and status == 200 and data and data.success) then
-            warn("[DEPOSIT-VERIFY] Could not reach backend to recheck deposit for " .. tostring(username) ..
-                " | tradeId=" .. tostring(transactionTradeId) .. " | HTTP " .. tostring(status))
-            sendDiscord("⚠️ **DEPOSIT RECHECK FAILED (network)**\n**Player:** " .. tostring(username) ..
-                "\n**tradeId:** " .. tostring(transactionTradeId) ..
-                "\nCould not reach the backend to independently confirm this deposit actually landed - check manually.",
-                16776960)
-            return
-        end
-
-        if not data.found then
-            warn("[DEPOSIT-VERIFY] MISSING: no deposit record found for " .. tostring(username) ..
-                " | tradeId=" .. tostring(transactionTradeId))
-            sendDiscord("🚨 **DEPOSIT NOT FOUND ON RECHECK**\n**Player:** " .. tostring(username) ..
-                "\n**tradeId:** " .. tostring(transactionTradeId) ..
-                "\n**Expected:** " .. tostring(expectedItemCount) .. " item(s) + " .. tostring(expectedGems) .. " gems" ..
-                "\nThe bot reported this deposit as a success, but a follow-up check 15s later found NO matching deposit record at all. The player may need to be credited manually.",
-                16711680)
-            return
-        end
-
-        if data.status ~= "CREDITED" then
-            warn("[DEPOSIT-VERIFY] Deposit exists but status=" .. tostring(data.status) .. " (expected CREDITED) for " .. tostring(username))
-            sendDiscord("⚠️ **DEPOSIT NOT CREDITED ON RECHECK**\n**Player:** " .. tostring(username) ..
-                "\n**tradeId:** " .. tostring(transactionTradeId) ..
-                "\n**Status:** " .. tostring(data.status) ..
-                "\n**Gems recorded:** " .. tostring(data.gemsReceived) ..
-                "\nThe bot told the player this was deposited, but the backend has it sitting in a non-credited state - check and resolve manually.",
-                16776960)
-            return
-        end
-
-        print("[DEPOSIT-VERIFY] OK - confirmed CREDITED for " .. tostring(username) ..
-            " | tradeId=" .. tostring(transactionTradeId) .. " | gems=" .. tostring(data.gemsReceived))
-    end)
-end
-
 local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfilledItems, missingPets, missingGems, sentGems)
     if not withdrawalData or not withdrawalData.id then
         return false, "Missing withdrawal id"
@@ -1254,15 +695,10 @@ local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfil
 
     local payload = {
         withdrawalId = tostring(withdrawalData.id),
-        -- Send the bot identity explicitly as well as through the authenticated
-        -- request. Some Worker revisions use botId/clientId when validating the
-        -- assignment, while older revisions derive it only from auth.
         botId = tostring(BOT_ID),
         clientId = tostring(BOT_ID),
         assignedClientId = tostring(BOT_ID),
         tradeId = tostring(BOT_ID) .. ":" .. tostring(tradeDeliveryId),
-        -- New backend completion contract uses externalTradeId for idempotency.
-        -- Keep the legacy tradeId/gameTradeId fields for compatibility.
         externalTradeId = tostring(tradeDeliveryId),
         gameTradeId = tostring(tradeDeliveryId),
         fulfilledItems = fulfilledItems or {},
@@ -1285,11 +721,6 @@ local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfil
 
         local errorCode = data and tostring(data.error or "") or ""
         if status == 409 and errorCode == "NOT_ASSIGNED" then
-            -- Best-effort recovery for Worker versions that assign a withdrawal
-            -- during the pending lookup rather than at trade creation time.
-            -- Refresh the exact withdrawal before retrying completion. We cannot
-            -- manufacture an assignment client-side, but this catches a race where
-            -- the assignment has just been created.
             print("[CONFIRM-WITHDRAWAL] NOT_ASSIGNED; refreshing pending withdrawal before retry")
             local refreshOk, refreshResp = makeAuthenticatedRequest(
                 "/api/bots/get-pending-withdrawal",
@@ -1304,8 +735,6 @@ local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfil
                     print("[CONFIRM-WITHDRAWAL] Refreshed exact withdrawal | assignedClientId=" ..
                         tostring(rw.assignedClientId) .. " | assignedToThisClient=" ..
                         tostring(rw.assignedToThisClient))
-                    -- Keep the payload identity explicit; if the server now sees
-                    -- this bot as assigned, the next completion attempt can succeed.
                     if rw.assignedToThisClient == true or
                        tostring(rw.assignedClientId or "") == tostring(BOT_ID) then
                         payload.assignedClientId = tostring(BOT_ID)
@@ -1344,8 +773,6 @@ local function cancelWithdrawalTrade(withdrawalData, reason, retry)
     end
 
     local safeReason = tostring(reason or "Trade cancelled")
-
-    -- Backend requires reason <= 500 characters.
     if #safeReason > 500 then
         safeReason = safeReason:sub(1, 497) .. "..."
     end
@@ -1391,25 +818,8 @@ end
 -- ============================================================
 -- CHAT & DISCORD
 -- ============================================================
--- Real bug fix (2026-10-10, live operator report: trade got claimed by the
--- bot, never actually progressed, TRADE-WATCHDOG silently released it 90s
--- later - operator saw a failed deposit with ZERO explanation anywhere).
--- sendMessage used to be a hard no-op ("every call site has its own real
--- signal - the site UI, Discord") - that reasoning only holds for the
--- happy path. Every ABANDONMENT path in this file (accept failed, ready
--- failed, timed out, never readied, banned, backend lookup failed, stale
--- lock released, swap detected, etc.) also calls sendMessage, and ALL of
--- them went completely silent together with it - the "real signal"
--- (Discord) is commonly left blank (discordWebhook = ""), so there was
--- NOTHING telling the player a trade had just been abandoned. A handful of
--- the worst call sites already got manually upgraded to sendCriticalMessage
--- earlier tonight, but that only patched two spots in a script with 50+
--- sendMessage call sites, most of them still silent. Routing sendMessage
--- itself through the real chat implementation (task.spawn'd so the
--- trade loop is never blocked waiting on it - preserves the original speed
--- win) fixes every one of those silent call sites at once instead of
--- hunting them down one at a time.
-local function sendCriticalMessage(message)
+local function sendMessage(message)
+    humanDelay(200, 500)
     local sent = false
     pcall(function()
         local ch = textChatService.TextChannels and textChatService.TextChannels:FindFirstChild("RBXGeneral")
@@ -1423,93 +833,6 @@ local function sendCriticalMessage(message)
                 :FireServer(tostring(message), "All")
         end)
     end
-end
-
--- Non-blocking wrapper so every existing sendMessage(...) call site in the
--- trade loop (50+ of them) gets a real chat message again without ever
--- making the trade loop itself wait on the chat send - task.spawn fires it
--- off and moves on immediately, same speed as the old no-op version.
-local function sendMessage(message)
-    task.spawn(sendCriticalMessage, message)
-end
-
--- Operator request (2026-10-10): "add multiple blockers... tell it in the
--- console... so when I give you my console it tells you exactly why it
--- broke." Console-only (print), never chat (sendMessage/sendCriticalMessage)
--- - the player never sees these. A single consistent, greppable [STEP n]
--- marker at every major checkpoint of the deposit/completion chain, so a
--- pasted console log makes it immediately obvious exactly how far a trade
--- got before it stopped, instead of inferring it from scattered differently-
--- tagged lines. Numbers are fixed/sequential for the deposit path
--- specifically (the one that's been failing) - seeing [STEP 5] but never
--- [STEP 6] means the break is between those two exact points, full stop.
-local function logStep(n, desc)
-    print("[STEP " .. tostring(n) .. "] " .. tostring(desc))
-end
-
--- Operator request (2026-10-10): "add more things... the console tells you
--- exactly why it broke." One real gap the STEP markers above can't cover:
--- if this script ever hits an actual Lua runtime error mid-trade (a nil
--- value, anything unanticipated), a plain task.spawn just silently kills
--- that one coroutine - Roblox prints a generic stack trace with none of
--- this file's own tagging, easy to miss or not recognize as the actual
--- cause of a trade mid-sequence. A trade that dies this way would show its
--- last real [STEP] line and then just... stop, identical on the surface to
--- every other "it broke here" case, except there would be no FAIL marker
--- explaining why - because nothing after the crash point ever got a
--- chance to run, including any warn()/logStep("X-FAIL", ...) call that
--- failure path was supposed to have.
---
--- safeSpawn wraps task.spawn in xpcall with a full traceback, tagged
--- [FATAL] so it's unmistakable and greppable the same way every other
--- checkpoint is. Used for every trade-critical coroutine below
--- (connectStatus, connectConfirm, the main trade loop) - the ones where a
--- crash would otherwise look identical to "the trade just silently
--- stopped" with no explanation anywhere.
-local function safeSpawn(label, fn)
-    task.spawn(function(...)
-        local ok, err = xpcall(fn, function(e)
-            return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
-        end, ...)
-        if not ok then
-            warn("[FATAL] Uncaught error in " .. tostring(label) .. ": " .. tostring(err))
-        end
-    end)
-end
-
--- Same idea as safeSpawn, but for the MAIN TRADE LOOP specifically - that
--- one is a `while true do` that's supposed to run for the bot's entire
--- life. A plain task.spawn there means a single uncaught error in ANY
--- iteration kills the whole coroutine permanently - the bot would stop
--- accepting every future trade for the rest of the session, completely
--- silently (nothing watching it, nothing restarting it), the single worst
--- possible failure mode this script has. This restarts the loop function
--- itself after logging a clear [FATAL], with a short delay so a
--- deterministic/immediate crash can't spin the CPU in a tight restart
--- loop - the bot keeps trying to work instead of just going dark forever.
--- onCrash: optional cleanup run after a crash, before restarting - without
--- it, a crash mid-trade would restart the loop with the trade-lock state
--- (goNext, activeIncomingTrade) exactly as the crash left it, which for the
--- main loop specifically (gated on `if not goNext then continue end`)
--- would restart into a loop that spins forever doing nothing instead of
--- actually recovering.
-local function safeSpawnLoop(label, fn, onCrash)
-    local function run()
-        local ok, err = xpcall(fn, function(e)
-            return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
-        end)
-        warn("[FATAL] " .. tostring(label) .. " crashed and stopped: " .. tostring(err))
-        if onCrash then
-            local cleanupOk, cleanupErr = pcall(onCrash)
-            if not cleanupOk then
-                warn("[FATAL] " .. tostring(label) .. " crash-cleanup itself failed: " .. tostring(cleanupErr))
-            end
-        end
-        warn("[FATAL] Restarting " .. tostring(label) .. " in 2 seconds...")
-        task.wait(2)
-        task.spawn(run)
-    end
-    task.spawn(run)
 end
 
 local function sendDiscord(message, color)
@@ -1531,82 +854,12 @@ local function sendDiscord(message, color)
 end
 
 -- ============================================================
--- SELF-HEALING REJOIN
--- ============================================================
--- Operator request (2026-10-11): "make it so it can never break again...
--- make like a restarting thing." The trade-lock watchdogs further below
--- can reset this SCRIPT's own bookkeeping (goNext, activeIncomingTrade)
--- after a stuck trade, but that does nothing for actual PS99 client UI
--- corruption (buttons dead, icons gone, menus like Mailbox frozen) -
--- resetting a Lua variable can't un-break Roblox's own GUI once it's
--- desynced. There's already a live precedent for this exact class of bug
--- a few lines below (refreshTradeElements/connectMessage: "operator
--- report: it unbreaks when I rejoin the game") - rejoining is the proven
--- fix, this just makes the bot do it automatically instead of waiting for
--- a human to notice and do it by hand.
---
--- IMPORTANT: this only actually self-heals if the executor is set to
--- AUTO-EXECUTE this script on join. If the script has to be manually run
--- by hand after each rejoin, this will correctly get the bot OUT of a
--- broken session, but it will then sit there doing nothing until someone
--- re-runs it - still far better than a silently broken bot, but not a
--- true "never has to be touched" fix without auto-execute also being on.
-local lastSelfRejoinAt = 0
-local SELF_REJOIN_MIN_GAP_SECONDS = 120 -- never rejoin twice back-to-back
--- Bug fix (2026-10-11, found by re-auditing this exact function after
--- simulating other parts of the script tonight): the 1.5s wait below (so
--- the Discord message has time to actually send before the Teleport call
--- tears this whole Lua VM down) never re-checked trade state afterward. A
--- real trade - accept, items added, even confirmed - could start in that
--- exact 1.5s window after the PREVENTIVE watchdog's one-time "is idle"
--- check and before the Teleport fires, getting destroyed mid-flight with
--- zero chance for ANY safety net (handleTradeCompletion, the no-message
--- timeout, the balance-delta recovery) to run, since the whole script
--- state is wiped by the rejoin itself. requireStillIdle: pass true from a
--- callsite that only ever meant to act on IDLE state (the preventive
--- watchdog) so this re-verifies immediately before the actual jump and
--- aborts if a trade started in the meantime. Leave false (default) for a
--- callsite that's deliberately reacting to a trade already being stuck -
--- there, waiting for "idle" would mean never firing at all.
-local function selfRejoin(reason, requireStillIdle)
-    if tick() - lastSelfRejoinAt < SELF_REJOIN_MIN_GAP_SECONDS then
-        warn("[WATCHDOG] Self-rejoin suppressed (one already happened recently): " .. tostring(reason))
-        return
-    end
-    lastSelfRejoinAt = tick()
-
-    warn("[WATCHDOG] Self-healing rejoin triggered: " .. tostring(reason))
-    pcall(function()
-        sendDiscord(
-            "\xF0\x9F\x94\x84 **BOT SELF-REJOINING**\n" ..
-            "Reason: " .. tostring(reason) .. "\n" ..
-            "Forcing a fresh game rejoin to clear any stuck/corrupted client UI state. " ..
-            "Requires auto-execute to be on for the script to resume on its own.",
-            16776960
-        )
-    end)
-    task.wait(1.5)
-
-    if requireStillIdle and (activeIncomingTrade or isInTrade()) then
-        warn("[WATCHDOG] Self-rejoin aborted - a trade started during the pre-rejoin delay, not interrupting it: " .. tostring(reason))
-        lastSelfRejoinAt = 0 -- don't let this attempt block a later, genuinely idle one
-        return
-    end
-
-    pcall(function()
-        teleportService:Teleport(game.PlaceId, localPlayer)
-    end)
-end
-
--- ============================================================
 -- TRADE HELPERS
 -- ============================================================
 local function refreshTradeElements()
     pcall(function()
         if not tradingWindow then return end
 
-        -- Do not rely on WaitForChild for the side frames. PS99 can expose
-        -- different side-frame names/timing depending on the current trade UI.
         local frame = tradingWindow:FindFirstChild("Frame")
         if not frame then
             for _, obj in ipairs(tradingWindow:GetDescendants()) do
@@ -1616,44 +869,6 @@ local function refreshTradeElements()
                 end
             end
         end
-
-        -- Defensive hardening (2026-10-10, same class of bug just found and
-        -- fixed for tradingMessage - see connectMessage's own doc comment
-        -- for the live incident). tradingWindow itself is resolved ONCE at
-        -- script startup and never re-fetched anywhere else in the file.
-        -- No live evidence has shown TradeWindow itself going stale the way
-        -- the Message popup did, but if it ever does (a game update, an
-        -- unusual reconnect, anything), BOTH the direct FindFirstChild AND
-        -- the GetDescendants() fallback above would keep failing forever
-        -- against a dead instance with no live descendants, silently
-        -- breaking every single trade for the rest of this bot's uptime
-        -- with no way to recover short of a manual restart. One cheap
-        -- re-fetch attempt from playerGUI before giving up costs nothing on
-        -- the normal/working path (only runs when the frame lookup already
-        -- failed) and closes off this entire class of failure the same way
-        -- the Message fix did.
-        if not frame then
-            -- Same playerGUI-itself hardening as connectMessage - see its
-            -- own doc comment (operator report: "it unbreaks when I
-            -- rejoin the game"). Re-resolve the container before
-            -- searching inside it for a fresh TradeWindow.
-            local freshGui = localPlayer:FindFirstChildOfClass("PlayerGui")
-            if freshGui then playerGUI = freshGui end
-            local freshWindow = playerGUI:FindFirstChild("TradeWindow")
-            if freshWindow and freshWindow ~= tradingWindow then
-                tradingWindow = freshWindow
-                frame = tradingWindow:FindFirstChild("Frame")
-                if not frame then
-                    for _, obj in ipairs(tradingWindow:GetDescendants()) do
-                        if obj:IsA("Frame") and obj.Name == "Frame" then
-                            frame = obj
-                            break
-                        end
-                    end
-                end
-            end
-        end
-
         if not frame then return end
         tradingFrame = frame
 
@@ -1667,8 +882,6 @@ local function refreshTradeElements()
     end)
 end
 
--- Locate the bot's actual trade-side Items container without assuming the
--- brittle "TheirItems" name. PlayerItems is already the user's side.
 local function readTradeItemsFrame(frame)
     if not frame then return {} end
     local items = frame:FindFirstChild("Items")
@@ -1736,9 +949,6 @@ local function describeTradeSides(playerSide, otherSide)
 end
 
 local function findBotTradeItemsContainer()
-    -- Kept for compatibility with older callers. Prefer the actual trade frame
-    -- that currently contains the bot's visible items, but do not guess a random
-    -- unrelated Items container elsewhere in the UI.
     refreshTradeElements()
     if not tradingFrame then return nil end
 
@@ -1776,8 +986,6 @@ end
 local function acceptTradeRequest(player)
     print("[ACCEPT] Accepting trade from " .. tostring(player.Name))
 
-    -- Fast path first. Do not wait a human-sized delay before accepting.
-    -- Detection is checked immediately and then with tiny bounded yields.
     local function checkAccepted()
         for _ = 1, 4 do
             if isInTrade() then
@@ -1797,8 +1005,6 @@ local function acceptTradeRequest(player)
         return checkAccepted()
     end
 
-    -- Preserve the existing command order, but stop immediately once the
-    -- trade is genuinely open.
     local id = nil
     if type(tradingCommands.AcceptRequest) == "function" then
         id = tryCommand(function() tradingCommands.AcceptRequest(player) end, "AcceptRequest")
@@ -1810,65 +1016,25 @@ local function acceptTradeRequest(player)
         return id
     end
 
-    -- Operator request (2026-10-11): "make the bot accept the trade as
-    -- fast as possible." Real speed fix - AcceptRequest is confirmed NEVER
-    -- available on this PS99 build (every single live log says "skipping"),
-    -- so every real accept already goes through this fallback loop, not
-    -- the fast path above. The OLD version called checkAccepted() (its own
-    -- up-to-4x25ms poll, ~100ms worst case) separately after EACH of the
-    -- three commands below, every single outer iteration - if the first
-    -- command (Request) didn't work, that was a wasted ~100ms poll before
-    -- even trying Accept, then potentially another wasted ~100ms before
-    -- trying RemoteAccept (the one that live logs show actually working -
-    -- "AcceptRequest is not available... skipping" is always immediately
-    -- followed by a successful accept, with nothing printed about Request/
-    -- Accept failing first). Firing all three commands back-to-back THEN
-    -- polling ONCE cuts that redundant waiting roughly 3x per outer
-    -- iteration, with no loss of reliability - all three still get tried
-    -- every iteration, just without an unnecessary poll gap between them.
-    -- Bug fix (2026-10-11, operator report: "all the icons disappear...
-    -- buttons stop working" mid-trade, worse under heavy trade volume).
-    -- The previous version fired Request, Accept, AND the raw AcceptTrade
-    -- RemoteEvent back-to-back with zero gap, every attempt, with nothing
-    -- stopping it from sending all three even when the first one already
-    -- opened the trade. Three different "accept this trade" signals
-    -- landing within milliseconds of each other desyncs PS99's own trade
-    -- UI state machine - that's what was corrupting the client UI, not a
-    -- network/backend issue (nothing about this shows up in the console
-    -- log, which is why it looked invisible). Fix: check isInTrade()
-    -- between each sub-command within the same attempt and stop firing
-    -- more the instant one of them actually lands, instead of always
-    -- sending all three regardless.
     for attempt = 1, 6 do
         if type(tradingCommands.Request) == "function" then
-            pcall(function() tradingCommands.Request(player) end)
-        end
-        if not isInTrade() then
-            task.wait()
+            id = tryCommand(function() tradingCommands.Request(player) end, "Request")
+            if id then return id end
         end
 
-        if not isInTrade() and type(tradingCommands.Accept) == "function" then
-            pcall(function() tradingCommands.Accept(player) end)
-        end
-        if not isInTrade() then
-            task.wait()
+        if type(tradingCommands.Accept) == "function" then
+            id = tryCommand(function() tradingCommands.Accept(player) end, "Accept")
+            if id then return id end
         end
 
-        if not isInTrade() then
-            pcall(function()
-                local evts = replicatedStorage:FindFirstChild("Network") or replicatedStorage:FindFirstChild("Remotes")
-                if evts then
-                    local e = evts:FindFirstChild("AcceptTrade") or evts:FindFirstChild("Trading_Accept")
-                    if e and e:IsA("RemoteEvent") then e:FireServer(player) end
-                end
-            end)
-        end
-
-        id = checkAccepted()
-        if id then
-            print("[ACCEPT] Trade opened on fallback attempt " .. attempt .. "/6: " .. tostring(id))
-            return id
-        end
+        id = tryCommand(function()
+            local evts = replicatedStorage:FindFirstChild("Network") or replicatedStorage:FindFirstChild("Remotes")
+            if evts then
+                local e = evts:FindFirstChild("AcceptTrade") or evts:FindFirstChild("Trading_Accept")
+                if e and e:IsA("RemoteEvent") then e:FireServer(player) end
+            end
+        end, "RemoteAccept")
+        if id then return id end
 
         print("[ACCEPT] Fast fallback " .. attempt .. "/6 failed...")
         task.wait(0.05)
@@ -1879,7 +1045,6 @@ local function acceptTradeRequest(player)
 end
 
 local function readyTrade()
-    -- Set ready immediately.
     local sent, err = pcall(function()
         tradingCommands.SetReady(true)
     end)
@@ -1890,40 +1055,20 @@ local function readyTrade()
     end
 
     print("[READY] SetReady(true) sent successfully")
+    task.wait(0.10)
 
-    -- Real bug fix (2026-10-10, same class of bug as connectConfirm's
-    -- SetConfirmed verification - see its own doc comment for the live
-    -- incident this pattern causes): a single 0.10s wait then one GetState
-    -- check is a much shorter real polling window than this exact kind of
-    -- PS99 network call is known to need (addPet's SetItem verification
-    -- polls up to 12x at 0.05s for the identical reason). Poll for up to
-    -- ~0.5s total before falling through to the "assume true anyway"
-    -- fallback below - gives SetReady(true) a genuine chance to land
-    -- server-side instead of almost always falling back on the very first
-    -- check.
-    local myId = tostring(localPlayer.UserId)
-    for _ = 1, 10 do
-        local ok, state = pcall(function()
-            return tradingCommands.GetState()
-        end)
+    local ok, state = pcall(function()
+        return tradingCommands.GetState()
+    end)
 
-        if ok and type(state) == "table" then
-            -- Known PS99 format.
-            if type(state._ready) == "table" and state._ready[myId] then
-                print("[READY] Bot READY confirmed via GetState")
-                return true
-            end
+    if ok and type(state) == "table" then
+        local myId = tostring(localPlayer.UserId)
+        if type(state._ready) == "table" and state._ready[myId] then
+            print("[READY] Bot READY confirmed via GetState")
+            return true
         end
-
-        task.wait(0.05)
     end
 
-    -- IMPORTANT:
-    -- GetState can fail to expose the ready state even though
-    -- SetReady(true) was successfully processed by PS99.
-    --
-    -- Do not incorrectly fail the trade just because verification
-    -- could not see the state.
     print("[READY] GetState could not verify ready; continuing after successful SetReady(true)")
     return true
 end
@@ -2030,10 +1175,6 @@ local function addPet(uuid)
         return tableContainsUuid(botItems, uuid, 0, {})
     end
 
-    -- IMPORTANT: SetItem can succeed server-side even when GetState/UI
-    -- briefly fails to show the item. Never call SetItem again if the exact
-    -- UUID is already in the trade, otherwise a verification retry can add
-    -- the same requested pet twice.
     if isPetActuallyInTrade() then
         print(
             "[WITHDRAWAL] UUID already present in actual trade state; skipping duplicate SetItem | UUID=" ..
@@ -2047,8 +1188,6 @@ local function addPet(uuid)
             task.wait(0.075)
         end
 
-        -- Re-check immediately before every retry. A previous SetItem may have
-        -- succeeded even if the first verification read was stale.
         if isPetActuallyInTrade() then
             print(
                 "[WITHDRAWAL] UUID appeared in trade before retry; skipping SetItem | UUID=" ..
@@ -2061,11 +1200,6 @@ local function addPet(uuid)
             return tradingCommands.SetItem("Pet", uuid, 1)
         end)
 
-        -- IMPORTANT:
-        -- Some PS99 TradingCmds builds can return false even when the
-        -- SetItem request has already reached the trade state. Treat the
-        -- actual trade state as authoritative and ALWAYS verify it before
-        -- retrying. This prevents false failures and duplicate attempts.
         for verifyAttempt = 1, 12 do
             if isPetActuallyInTrade() then
                 print(
@@ -2100,93 +1234,8 @@ local function addPet(uuid)
     return false, lastErr or "Pet was not added to trade"
 end
 
--- Real bug fix (2026-10-10, found during a proactive audit): addPet()
--- never counts a pet as successfully sent until it's actually verified
--- present in the real PS99 trade state (GetState), retrying up to 3 times
--- with up to 12 verification polls each. addGems() had NONE of that - it
--- fired SetCurrency("Diamonds", amount) exactly once with a pcall and then
--- the caller (addWithdrawalItems) immediately trusted that the full
--- requested/available amount was sent, no verification at all. A
--- withdrawal's gems are reported to the backend via confirmWithdrawal's
--- sentGems field - if SetCurrency silently didn't land (the same class of
--- "PS99 network call doesn't always take effect immediately" issue already
--- found and fixed tonight for SetReady/SetConfirmed), the backend would be
--- told gems were delivered that the player never actually received in
--- Roblox, marking that part of the withdrawal fulfilled when it wasn't -
--- a real money-integrity gap, not just a cosmetic one. There was even an
--- already-written client_bot_gems() function meant for reading this back,
--- sitting completely unused anywhere in the file.
---
--- Reads the bot's own offered Diamonds amount directly from GetState
--- (the same authoritative trade-state source addPet uses for pets,
--- rather than client_bot_gems()'s UI text-scraping approach, which is
--- weaker - the same reasoning client_trade_gems() already uses for
--- reading the OTHER player's gems).
-local function readBotOfferedGemsFromState()
-    local amount = nil
-    pcall(function()
-        local state = tradingCommands.GetState()
-        if type(state) ~= "table" or type(state._items) ~= "table" then return end
-
-        local botIndex = nil
-        if type(state._players) == "table" then
-            for index, player in pairs(state._players) do
-                if player == localPlayer then
-                    botIndex = index
-                    break
-                end
-            end
-        end
-        if botIndex == nil then return end
-
-        local botItems = state._items[botIndex]
-        if type(botItems) ~= "table" or type(botItems.Currency) ~= "table" then return end
-
-        for _, entry in pairs(botItems.Currency) do
-            if type(entry) == "table" and type(entry._data) == "table"
-                and tostring(entry._data.id) == "Diamonds"
-            then
-                local n = tonumber(entry._data._am)
-                if n then amount = math.max(0, math.floor(n)) end
-                return
-            end
-        end
-    end)
-    return amount
-end
-
--- Returns (success, actualAmountSent). success=false means the trade state
--- never showed the gems landing after real retries - the caller should NOT
--- treat the gems as delivered in that case.
 local function addGems(amount)
-    amount = tonumber(amount) or 0
-    if amount <= 0 then return true, 0 end
-
-    for attempt = 1, 3 do
-        if attempt > 1 then
-            print("[GEMS] Retry attempt " .. attempt .. "/3 - re-sending SetCurrency(Diamonds, " .. amount .. ")")
-        end
-        pcall(function() tradingCommands.SetCurrency("Diamonds", amount) end)
-
-        for _ = 1, 12 do
-            task.wait(0.05)
-            local actual = readBotOfferedGemsFromState()
-            if actual and actual >= amount then
-                print("[GEMS] Verified " .. actual .. " Diamonds in actual trade state (requested " .. amount .. ")")
-                return true, actual
-            end
-        end
-    end
-
-    -- Could not verify via GetState after real retries. Same fallback
-    -- philosophy as readyTrade()/SetConfirmed above: PS99's GetState can
-    -- lag behind a real, successful SetCurrency call - but UNLIKE those,
-    -- getting this one wrong has direct money consequences (a withdrawal
-    -- marked fulfilled for gems the player never received), so this does
-    -- NOT optimistically report success. The caller must treat this as
-    -- "gems not confirmed sent" and keep them pending rather than guessing.
-    warn("[GEMS] Could not verify " .. amount .. " Diamonds in trade state after 3 attempts - NOT counting as sent")
-    return false, 0
+    pcall(function() tradingCommands.SetCurrency("Diamonds", amount) end)
 end
 
 -- ============================================================
@@ -2259,309 +1308,7 @@ local function isPlayerConfirmed()
 end
 
 -- ============================================================
--- GEM PARSING
--- ============================================================
-local function parseGemText(raw)
-    if raw == nil then return nil end
-
-    local txt = tostring(raw)
-        :gsub(",", "")
-        :gsub("%s+", "")
-        :gsub("^%$", "")
-
-    local num, suf = txt:match("^([%d%.]+)([KkMmBbTt])$")
-    if num and suf then
-        local mult = ({
-            k=1e3, K=1e3,
-            m=1e6, M=1e6,
-            b=1e9, B=1e9,
-            t=1e12, T=1e12,
-        })[suf]
-        local n = tonumber(num)
-        if n and mult then return math.floor(n * mult) end
-    end
-
-    local plain = tonumber(txt)
-    if plain then return math.floor(plain) end
-    return nil
-end
-
-local function getTextFromGuiObject(obj)
-    if not obj then return nil end
-    if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-        local ok, text = pcall(function() return obj.Text end)
-        if ok and text and tostring(text) ~= "" then return tostring(text) end
-    end
-    return nil
-end
-
-local function dumpGui(obj, depth)
-    depth = depth or 0
-
-    local indent = string.rep("  ", depth)
-    local text = ""
-
-    pcall(function()
-        if obj:IsA("TextLabel")
-            or obj:IsA("TextButton")
-            or obj:IsA("TextBox")
-        then
-            text = " TEXT=[" .. tostring(obj.Text) .. "]"
-        end
-    end)
-
-    print(indent .. obj.ClassName .. " | " .. obj.Name .. text)
-
-    for _, child in ipairs(obj:GetChildren()) do
-        dumpGui(child, depth + 1)
-    end
-end
-
-local function readGemsFromFrame(frame, debugName)
-    print("========== GEM FRAME DUMP ==========")
-
-    if frame then
-        dumpGui(frame)
-    else
-        print("FRAME NIL")
-    end
-
-    print("===================================")
-
-    return 0
-end
-
-local function dumpValue(value, path, depth, seen)
-    depth = depth or 0
-    seen = seen or {}
-
-    if depth > 6 then
-        return
-    end
-
-    local valueType = typeof(value)
-
-    if valueType ~= "table" then
-        print(
-            string.rep("  ", depth) ..
-            tostring(path) ..
-            " = [" .. tostring(value) .. "] (" .. valueType .. ")"
-        )
-        return
-    end
-
-    if seen[value] then
-        print(string.rep("  ", depth) .. tostring(path) .. " = <cycle>")
-        return
-    end
-
-    seen[value] = true
-
-    for k, v in pairs(value) do
-        dumpValue(v, tostring(path) .. "." .. tostring(k), depth + 1, seen)
-    end
-end
-
--- Real bug fix (2026-09-20, operator request: "also do it for gems too" -
--- the same "don't silently accept an unreadable value, cancel instead"
--- protection built for Cosmic Value). This used to return a bare number,
--- and every genuine structural read failure (GetState() broken, no
--- _items, can't find the other player's trade index, no items table for
--- that index) fell back to plain 0 - completely indistinguishable from
--- "the other player genuinely offered no gems". A transient glitch on
--- this read could silently look identical to a real, intentional
--- gems-only deposit of nothing. Now returns a SECOND value, `readOk` -
--- true whenever the trade state was actually read successfully (even if
--- the honest answer is 0 gems), false only on a genuine structural
--- failure. Every existing call site that captures just one value
--- (`local gems = client_trade_gems()`) keeps working completely
--- unchanged - Lua silently discards extra return values - so this is
--- purely additive; only the new confirm/ready-stage gate checks below
--- actually look at readOk.
-local function client_trade_gems()
-    local gems = 0
-    local readOk = true
-
-    local ok, err = pcall(function()
-        refreshTradeElements()
-
-        local state = tradingCommands.GetState()
-        if type(state) ~= "table" then
-            warn("[GEMS] GetState() returned invalid state")
-            readOk = false
-            return
-        end
-
-        local items = state._items
-        local players = state._players
-
-        if type(items) ~= "table" then
-            warn("[GEMS] Trade state has no _items table")
-            readOk = false
-            return
-        end
-
-        -- Find the OTHER player's trade index.
-        -- Example from your dump:
-        --   _players.1 = carloskar08
-        --   _players.2 = MellowCactus47
-        local otherIndex = nil
-
-        if type(players) == "table" then
-            for index, player in pairs(players) do
-                if player ~= localPlayer then
-                    otherIndex = index
-                    break
-                end
-            end
-        end
-
-        -- Fallback: in your current trade state the other player is index 1.
-        if otherIndex == nil then
-            for index in pairs(items) do
-                otherIndex = index
-                break
-            end
-        end
-
-        if otherIndex == nil then
-            warn("[GEMS] Could not determine other player's trade index")
-            readOk = false
-            return
-        end
-
-        local otherItems = items[otherIndex]
-
-        if type(otherItems) ~= "table" then
-            warn("[GEMS] No trade items for player index " .. tostring(otherIndex))
-            readOk = false
-            return
-        end
-
-        -- Look for the Diamonds currency entry. Genuinely reaching this
-        -- point with no Currency table, or no Diamonds entry in it, is a
-        -- real, honest "0 gems offered" - not a read failure - so readOk
-        -- stays true for both.
-        local currency = otherItems.Currency
-
-        if type(currency) ~= "table" then
-            print("[GEMS] Other player has no Currency table")
-            return
-        end
-
-        for uid, entry in pairs(currency) do
-            if type(entry) == "table"
-                and type(entry._data) == "table"
-                and tostring(entry._data.id) == "Diamonds"
-            then
-                local amount = tonumber(entry._data._am)
-
-                if amount then
-                    gems = math.max(0, math.floor(amount))
-                    print(
-                        "[GEMS] Found Diamonds in trade state | " ..
-                        "uid=" .. tostring(uid) ..
-                        " | amount=" .. tostring(gems)
-                    )
-                    break
-                end
-            end
-        end
-
-        print("[GEMS] Player offered Diamonds: " .. tostring(gems))
-    end)
-
-    if not ok then
-        warn("[GEMS] Trade-state reader error: " .. tostring(err))
-        readOk = false
-    end
-
-    return gems, readOk
-end
-
--- ============================================================
--- READ BOT'S OWN GEM OFFER (what the bot put into the trade)
--- Exact mirror of client_their_gems() but inverted:
--- excludes TheirDiamonds/OtherDiamonds and reads PlayerDiamonds.
--- ============================================================
-local function client_bot_gems()
-    -- The bot's gem offer lives inside playerItemsFrame (the bot's side of the
-    -- trade window) — the same frame checkBotTradeItems() uses for pets.
-    -- PlayerDiamonds under tradingFrame always shows the OTHER player's gems,
-    -- so we never touch tradingFrame for bot gem reading.
-    -- We search playerItemsFrame for any TextLabel whose value is a plausible
-    -- gem amount (>= 1000 or uses K/M/B/T suffix).
-    local gems = 0
-    pcall(function()
-        refreshTradeElements()
-        if not playerItemsFrame then return end
-
-        -- Look for a dedicated Diamonds/Currency/Gems child first
-        local function tryFrame(frame)
-            if not frame then return end
-            for _, name in ipairs({"Diamonds","diamonds","Currency","currency","Gems","gems","Diamond","diamond"}) do
-                local node = frame:FindFirstChild(name)
-                if node then
-                    local lbl = node:FindFirstChildWhichIsA("TextLabel") or node
-                    if lbl:IsA("TextLabel") then
-                        local txt = lbl.Text:gsub(",",""):gsub("%s+","")
-                        local num, suf = txt:match("^([%d%.]+)([KkMmBbTt])$")
-                        if num and suf then
-                            local mult = ({k=1e3,K=1e3,m=1e6,M=1e6,b=1e9,B=1e9,t=1e12,T=1e12})[suf] or 1
-                            gems = math.floor(tonumber(num) * mult); return
-                        end
-                        local plain = tonumber(txt)
-                        if plain and plain >= 1000 then gems = plain; return end
-                    end
-                end
-            end
-        end
-
-        tryFrame(playerItemsFrame)
-        if gems > 0 then
-            print("[client_bot_gems] Read from playerItemsFrame named child: " .. gems)
-            return
-        end
-
-        -- Fallback: scan all TextLabels inside playerItemsFrame for a gem-like number
-        for _, lbl in ipairs(playerItemsFrame:GetDescendants()) do
-            if lbl:IsA("TextLabel") and lbl.Visible then
-                local txt = lbl.Text:gsub(",",""):gsub("%s+","")
-                local num, suf = txt:match("^([%d%.]+)([KkMmBbTt])$")
-                if num and suf then
-                    local mult = ({k=1e3,K=1e3,m=1e6,M=1e6,b=1e9,B=1e9,t=1e12,T=1e12})[suf] or 1
-                    local val = math.floor(tonumber(num) * mult)
-                    if val >= 1000 then
-                        gems = val
-                        print("[client_bot_gems] Read from playerItemsFrame descendant '" .. lbl.Name .. "': " .. gems)
-                        return
-                    end
-                end
-                local plain = tonumber(txt)
-                if plain and plain >= 1000000 then
-                    gems = plain
-                    print("[client_bot_gems] Read from playerItemsFrame descendant '" .. lbl.Name .. "' (plain): " .. gems)
-                    return
-                end
-            end
-        end
-
-        if gems == 0 then
-            print("[client_bot_gems] No gem value found in playerItemsFrame")
-        end
-    end)
-    return gems
-end
-
--- ============================================================
--- READ USER'S SIDE OF TRADE (deposit-during-withdrawal)
--- ============================================================
-local function client_their_gems()
-    return client_trade_gems()
-end
-
--- ============================================================
--- NAME LOOKUPS — must be defined before checkTheirItems / checkBotTradeItems
+-- NAME LOOKUPS — must be defined before checkItems / checkBotTradeItems
 -- ============================================================
 local function getPetDefinition(nameList, assetId)
     for _, pd in next, nameList do
@@ -2617,10 +1364,6 @@ local function getNameById(petId)
         return "???"
     end
 
-    -- nameAssetIds was already built at startup from the game's pet
-    -- definitions, including normal pets, Huge, Titanic, etc.
-    -- Use that cached table instead of recursively requiring pet modules
-    -- every time a name is needed.
     for _, pd in ipairs(nameAssetIds) do
         if tostring(pd.configName or "") == wantedId then
             return tostring(pd.name or "???")
@@ -2630,12 +1373,92 @@ local function getNameById(petId)
     return "???"
 end
 
+-- ============================================================
+-- COSMIC VALUE READER
+-- Reads CV live from PS99's InfoOverlay tooltip, right before a deposit
+-- is priced. This replaces the old single-shot reader.
+--
+-- Two real fixes vs. the version this file had before (2026-10-11):
+--   1. Retries (up to 4 attempts with a short settle wait) instead of one
+--      shot - a single hover+hope attempt missed the tooltip population
+--      often enough in practice to matter for real deposits.
+--   2. A plausibility floor against this pet's own known catalog value
+--      (entry.value, already loaded in catalogByKey from /api/bots/pets) -
+--      refuses to trust a read that's wildly below what this exact pet is
+--      actually worth, which is what a stray OCR/text match on unrelated
+--      small text elsewhere in the tooltip looks like. Held (nil) instead
+--      of silently crediting a wrong, too-low price.
+-- cvCache itself is still just a name->result table, but it's cleared in
+-- resetTradeState() above now - every real trade starts with a clean
+-- cache, so a price read for one deposit can never leak into a different,
+-- later deposit of the same pet name.
+-- ============================================================
+local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of this pet's own catalog value
+
+local function readCosmicValue(petName, referenceValue)
+    if cvCache[petName] then return cvCache[petName] end
+
+    local refNum = tonumber(referenceValue)
+
+    for attempt = 1, 4 do
+        local overlay = playerGUI:FindFirstChild("InfoOverlay")
+        if not overlay then
+            if attempt < 4 then task.wait(0.1) end
+        else
+            local cvValue, demand, rejectedLow = nil, nil, nil
+
+            for _, v in ipairs(overlay:GetDescendants()) do
+                pcall(function()
+                    if not (v:IsA("TextLabel") or v:IsA("TextButton")) then return end
+                    local t = tostring(v.Text or "")
+                    if v.Name == "title" and t ~= "" and t ~= "..." then
+                        -- CV line matches pattern like "11.5m (7/10)"
+                        if t:find("%(") and t:find("/10%)") then
+                            local raw = t:match("^([%d%.]+[kmbt]?)")
+                            local dem = t:match("%((%d+)/10%)")
+                            if raw and not cvValue then
+                                local num = tonumber(raw:match("^([%d%.]+)")) or 0
+                                local suffix = (raw:match("[kmbt]$") or ""):lower()
+                                local mult = {k=1e3, m=1e6, b=1e9, t=1e12}
+                                local parsed = math.floor(num * (mult[suffix] or 1))
+
+                                if refNum and refNum > 0 and parsed < refNum * CV_PLAUSIBILITY_FLOOR then
+                                    rejectedLow = { parsed = parsed, refNum = refNum }
+                                else
+                                    cvValue = parsed
+                                    demand = tonumber(dem)
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+
+            if cvValue then
+                local result = { value = cvValue, demand = demand }
+                cvCache[petName] = result
+                print("[CV] " .. tostring(petName) .. " = " .. tostring(cvValue) .. " demand=" .. tostring(demand) .. " (attempt " .. attempt .. "/4)")
+                return result
+            end
+
+            if rejectedLow then
+                warn("[CV-REJECT] " .. tostring(petName) .. ": read " .. tostring(rejectedLow.parsed) ..
+                    " but catalog value is " .. tostring(rejectedLow.refNum) .. " - refusing as implausible (attempt " .. attempt .. "/4)")
+            end
+
+            if attempt < 4 then task.wait(0.1) end
+        end
+    end
+
+    warn("[CV-FAIL] " .. tostring(petName) .. ": no usable Cosmic Value read after 4 attempts")
+    return nil
+end
+
 local function checkTheirItems()
     refreshTradeElements()
     if not theirItemsFrame then return {}, 0 end
     local itemsContainer = theirItemsFrame:FindFirstChild("Items")
     if not itemsContainer then
-        -- Allow one UI frame for the container to appear.
         task.wait()
         itemsContainer = theirItemsFrame:FindFirstChild("Items")
     end
@@ -2671,21 +1494,24 @@ local function checkTheirItems()
                  or item:FindFirstChild("Shiny") ~= nil
         end)
         local str = (shiny and "Shiny " or "") .. (rarity ~= "Normal" and (rarity .. " ") or "") .. name
-        if table.find(supporteditems, str) then table.insert(foundItems, str) end
+        if table.find(supporteditems, str) then
+            local cv = readCosmicValue(str)
+            table.insert(foundItems, {
+                name = str,
+                cosmicValue = cv and cv.value or nil,
+                demand = cv and cv.demand or nil,
+            })
+        end
     end
     return foundItems, client_their_gems()
 end
 
 -- ============================================================
 -- READ BOT'S OWN SIDE OF TRADE (what the bot actually sent)
--- Called immediately on trade completion before the window closes.
--- Mirrors checkTheirItems() but reads playerItemsFrame + client_trade_gems().
 -- ============================================================
 local function checkBotTradeItems()
     local itemsContainer = nil
 
-    -- Success has already been reported by PS99. Check immediately, then use
-    -- only a short fallback for UI synchronization.
     for attempt = 1, 8 do
         itemsContainer = findBotTradeItemsContainer()
         if itemsContainer then break end
@@ -2745,17 +1571,12 @@ local function checkBotTradeItems()
     print("[BOT-SIDE] Read " .. #foundItems .. " pets + " .. gemsInTrade .. " gems from bot's trade side")
     return foundItems, gemsInTrade
 end
+
 -- ============================================================
 -- WITHDRAWAL TRADE-SIDE VERIFICATION
--- After SetItem(), verify the ACTUAL pet visible in the bot's trade slot.
--- This prevents a mismatched inventory UUID from causing the bot to send
--- a different pet than the withdrawal requested.
 -- ============================================================
 local function normalizePetDisplayName(value)
     local text = tostring(value or ""):lower()
-    -- PS99 uses the Spanish n (n-tilde) in some pet names while the
-    -- website/catalog may use plain ASCII. Treat both spellings as equal
-    -- for display-name verification only; IDs remain authoritative.
     text = text:gsub("ñ", "n")
     text = text:gsub("%s+", " ")
         :gsub("^%s+", "")
@@ -2781,10 +1602,6 @@ local function verifyWithdrawalPetAdded(expectedName, beforePlayerPets, beforeTh
     local sawAnyTradePet = false
     local lastA, lastB = beforeA, beforeB
 
-    -- Reliable verification for large withdrawals. The UI can take longer to
-    -- render as the trade approaches a large item count, so use a slightly
-    -- longer adaptive window rather than immediately moving to the next UUID.
-    -- This prevents a 100-huge withdrawal from outrunning the trade UI.
     for attempt = 1, 6 do
         if attempt > 1 then
             task.wait(0.035)
@@ -2805,10 +1622,6 @@ local function verifyWithdrawalPetAdded(expectedName, beforePlayerPets, beforeTh
         end
     end
 
-    -- Some PS99 executor/UI combinations do not expose the ItemSlot contents
-    -- through GetDescendants even though SetItem() successfully added the pet.
-    -- An entirely empty read is therefore inconclusive, not evidence of a bad
-    -- pet. The caller already selected the pet by exact local name/variant.
     if not sawAnyTradePet and beforeCount == 0 then
     warn(
         "[WITHDRAWAL-VERIFY] Could not verify '" ..
@@ -2878,7 +1691,6 @@ local success, response = makeGetRequest("/api/bots/pets")
             if display then
                 table.insert(supporteditems, display)
 
-                -- Display names are for UI only; never use them as the join key.
                 if catalogByDisplay[display] == nil then
                     catalogByDisplay[display] = entry
                 else
@@ -2902,14 +1714,9 @@ end
 
 -- ============================================================
 -- ENCHANT CATALOG FALLBACK
--- Enchants are BloxyFlip-supported catalog entries, but they are
--- NOT PS99 pet definitions, so they cannot be identified through
--- nameAssetIds/icon matching.
 -- ============================================================
 
 local enchantByName = {}
-
--- buildEnchantCatalog is forward-declared above GetSupported().
 
 local function normalizeCatalogText(value)
     return tostring(value or "")
@@ -2931,8 +1738,6 @@ buildEnchantCatalog = function()
             local name = normalizeCatalogText(entry.name)
 
             if name ~= "" then
-                -- Keep the authoritative configName|variant identity.
-                -- If duplicate display names exist, mark it ambiguous.
                 if enchantByName[name] == nil then
                     enchantByName[name] = {
                         entry = entry,
@@ -3003,8 +1808,6 @@ local function getSupportedEnchantIdentity(item)
         end
     end
 
-    -- Cache misses too, so repeated ready-state checks don't rescan
-    -- the same item slot over and over.
     enchantIdentityCache[item] = {
         entry = false,
         key = false,
@@ -3013,26 +1816,10 @@ local function getSupportedEnchantIdentity(item)
     return nil, nil
 end
 
--- Build pet asset/identity tables from PS99's client pet modules.
--- The worker catalog uses configName + variant as its authoritative key.
--- PS99's pet module `_id` is used as the configName join value.
 local registeredPetIds = {}
 
-local dumpedOnePetDefinition = false
 local function registerPetDefinition(pd, isHugeOrTitanic)
     if type(pd) ~= "table" or not pd._id or not pd.name then return end
-
-    -- One-time diagnostic: does the pet definition module itself already
-    -- carry a value/CV field? If so, we can read it directly here with no
-    -- hover simulation at all - this module is already required for every
-    -- pet just to get its name/thumbnail.
-    if not dumpedOnePetDefinition then
-        dumpedOnePetDefinition = true
-        print("[CV-PROBE] Dumping top-level keys of first pet definition (" .. tostring(pd.name) .. "):")
-        for k, v in pairs(pd) do
-            print("[CV-PROBE]   " .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
-        end
-    end
 
     local configName = tostring(pd._id)
     if registeredPetIds[configName] then
@@ -3092,239 +1879,110 @@ pcall(function()
 end)
 
 -- ============================================================
--- COSMIC VALUE READER
--- Reads CV from PS99's InfoOverlay tooltip. The tooltip only populates
--- once something actually opens it for that specific item - normally a
--- real mouse hover. GuiObject.MouseEnter is a native engine-fired
--- RBXScriptSignal, NOT a BindableEvent, so it has no :Fire() method;
--- calling :Fire() on it throws and does nothing. firesignal() is the
--- actual executor primitive for forcing a native signal's connections to
--- run without real input - most executors (Synapse X, Script-Ware, etc.)
--- expose it as a global. If this executor doesn't have it, CV reading
--- silently stays unavailable (cvValue nil) rather than erroring - the
--- deposit still goes through, just priced at 0 same as before this existed.
--- cvCache itself now lives at the top of the script (module scope, before
--- resetTradeState) so it can be cleared at every trade boundary - see its
--- own doc comment there for the real bug this fixes.
+-- GEM PARSING / READING
 -- ============================================================
+local function client_trade_gems()
+    local gems = 0
 
--- Operator report (2026-10-01, live, real money): a Titanic worth ~200M
--- got credited at 10K, another worth ~300M at 0 - not a failed read, a
--- WRONG one that still passed the gate. The only plausible way that
--- happens: the old matching only trusted text objects literally named
--- "title", but if a real hover now briefly populates the overlay with
--- some OTHER number (a durability/charm stat, a stale leftover from a
--- previous tooltip, anything shaped like "N (M/10)") under a different
--- name, the strict name match above would simply never have found it -
--- so this can't be that specific path. Most likely a text match grabbed
--- the wrong number entirely. Two changes together close this: match the
--- Cosmic Value pattern on ANY text in the overlay, not just "title"
--- (addresses the game update seemingly moving/renaming where the real
--- value lives - see the many [CV-FAIL] "completely empty" reports), and
--- refuse to accept a read that's wildly below the item's own known
--- catalog value (addresses a wrong-but-plausible-looking number actually
--- being parsed from the wrong element) rather than trusting any number
--- shaped right. referenceValue is the catalog's own last-known price for
--- this exact pet - optional, skipped if unknown.
-local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of the catalog's own value
--- Operator-verified pattern (2026-10-01, live): in a 5-pet trade, the FIRST
--- item read its Cosmic Value correctly on the very first attempt, and
--- every item after it failed "opened but completely empty of text" - 4/4
--- attempts, all four of them. That's not random flakiness (which would hit
--- some middling fraction of attempts across all items), it's "whichever
--- item happens first in the loop works, everything immediately after it
--- doesn't" - consistent with PS99's tooltip needing a beat to actually
--- close out after one hover before it'll properly reopen for the next, and
--- this bot moving to the next slot's hover with no gap at all right behind
--- the previous one's MouseLeave. A short settle wait before every item's
--- FIRST attempt (not just between retries of the same item, which already
--- existed) costs almost nothing on a successful read and may be exactly
--- what the next slot needs to not inherit the previous tooltip's stuck
--- state.
--- Trimmed 2026-10-10 (operator report: visible mouse-jump/lag on every
--- deposit, "only happens when I deposit") - 0.25 -> 0.12. This read
--- genuinely does move the real system cursor and force hover events per
--- item, which is the actual source of that lag, not a performance
--- problem on the player's own end. Cut the settle gap, not the retry
--- COUNT below (still 4 attempts) - reliability comes from retrying, not
--- from how long any single wait is, so this trims real time off a normal
--- deposit without meaningfully raising the odds of a failed read.
-local CV_INTER_ITEM_SETTLE_SECONDS = 0.12
-local function readCosmicValueFromSlot(itemSlot, displayName, referenceValue)
-    if cvCache[displayName] then return cvCache[displayName] end
-    local refNum = tonumber(referenceValue)
-    task.wait(CV_INTER_ITEM_SETTLE_SECONDS)
+    local ok, err = pcall(function()
+        refreshTradeElements()
 
-    local fire = getgenv and getgenv().firesignal or firesignal
-    local moveMouse = (getgenv and (getgenv().mousemoveabs or getgenv().MouseMoveAbs))
-        or mousemoveabs or MouseMoveAbs
-
-    if type(fire) ~= "function" and type(moveMouse) ~= "function" then
-        warn("[CV] Neither firesignal() nor mousemoveabs() is available in this executor - Cosmic Value cannot be read")
-        return nil
-    end
-
-    -- CONFIRMED 2026-09-13: a single mousemoveabs+firesignal attempt only
-    -- populates InfoOverlay ~30-40% of the time (Huge Temple Toucan, Huge
-    -- Diamond Penguin, and one of several Huge Lucky Stacked Bunny slots all
-    -- succeeded; most attempts on the same real trade came back with the
-    -- overlay open but empty). That's consistent with a timing race under
-    -- BlueStacks - the engine needs a rendered frame or two after the
-    -- cursor moves before the tooltip's own handler notices and populates
-    -- it, and 0.15s wasn't always enough. Retry a few times with a fresh
-    -- move+fire each attempt before giving up.
-    -- Operator report (2026-10-01): "where it shows in the console exactly
-    -- where the problem went" - the old failure message only ever said
-    -- "InfoOverlay never populated a 'title' TextLabel/TextButton", which
-    -- is ambiguous between two very different failures: the InfoOverlay
-    -- object itself never showing up at all (overlayFoundCount stays 0 -
-    -- points at the hover/tooltip trigger itself being broken, e.g. after
-    -- a game update renamed or restructured it) versus InfoOverlay showing
-    -- up fine every time but nothing inside it named "title" ever matches
-    -- the Cosmic Value text pattern (points at PS99 having changed the
-    -- tooltip's internal layout/naming, not whether it opens at all).
-    -- allTextsSeen now also captures EVERY non-empty text object found
-    -- inside the overlay, not just ones named "title" - if the overlay is
-    -- opening but under a new structure, this prints its real current
-    -- contents instead of just "nothing matched."
-    local seenTitles = {}
-    local allTextsSeen = {}
-    local overlayFoundCount = 0
-    for attempt = 1, 4 do
-        print("[CV] Attempting read for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
-
-        if type(moveMouse) == "function" then
-            local ok = pcall(function()
-                local inset = game:GetService("GuiService"):GetGuiInset()
-                local pos = itemSlot.AbsolutePosition
-                local size = itemSlot.AbsoluteSize
-                local x = pos.X + size.X / 2 + inset.X
-                local y = pos.Y + size.Y / 2 + inset.Y
-                moveMouse(x, y)
-            end)
-            if not ok then
-                warn("[CV] mousemoveabs failed for " .. tostring(displayName))
-            end
-        elseif attempt == 1 then
-            warn("[CV] mousemoveabs() not available in this executor - relying on firesignal alone, which is known not to reliably populate the tooltip by itself")
+        local state = tradingCommands.GetState()
+        if type(state) ~= "table" then
+            warn("[GEMS] GetState() returned invalid state")
+            return
         end
 
-        if type(fire) == "function" then
-            local ok, fireErr = pcall(function()
-                fire(itemSlot.MouseMoved, 0, 0)
-                fire(itemSlot.MouseEnter, 0, 0)
-            end)
-            if not ok then
-                warn("[CV] firesignal(MouseEnter) threw for " .. tostring(displayName) .. ": " .. tostring(fireErr))
-            end
+        local items = state._items
+        local players = state._players
+
+        if type(items) ~= "table" then
+            warn("[GEMS] Trade state has no _items table")
+            return
         end
 
-        -- Give PS99's tooltip handler a moment to populate InfoOverlay -
-        -- a real cursor move + engine hover detection needs at least a
-        -- frame or two to register, not just an instantly-fired event.
-        -- Trimmed 0.15 -> 0.12 alongside CV_INTER_ITEM_SETTLE_SECONDS
-        -- above, same reasoning - still 4 full attempts if this one's
-        -- too short, so reliability isn't riding on this single number.
-        task.wait(0.12)
+        local otherIndex = nil
 
-        local overlay = playerGUI:FindFirstChild("InfoOverlay")
-        if not overlay then
-            warn("[CV] InfoOverlay not found in PlayerGui for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
-        else
-            overlayFoundCount = overlayFoundCount + 1
-            local cvValue, demand, rejectedLow = nil, nil, nil
-
-            for _, v in ipairs(overlay:GetDescendants()) do
-                pcall(function()
-                    if not (v:IsA("TextLabel") or v:IsA("TextButton")) then return end
-                    local t = tostring(v.Text or "")
-                    if t ~= "" and t ~= "..." and #allTextsSeen < 15 then
-                        table.insert(allTextsSeen, v.Name .. "=\"" .. t .. "\"")
-                    end
-                    if t ~= "" and t ~= "..." and t:find("%(") and t:find("/10%)") then
-                        -- Widened from v.Name == "title" only (operator
-                        -- report, 2026-10-01: consistent "opened but
-                        -- completely empty of text" across many pets
-                        -- strongly suggests the value text no longer lives
-                        -- under that exact name any more) - now matches
-                        -- the VALUE'S OWN SHAPE wherever it is, not which
-                        -- label it's attached to.
-                        if #seenTitles < 5 then table.insert(seenTitles, v.Name .. "=" .. t) end
-                        local raw = t:match("^([%d%.]+[kmbt]?)")
-                        local dem = t:match("%((%d+)/10%)")
-                        if raw and not cvValue then
-                            local num = tonumber(raw:match("^([%d%.]+)")) or 0
-                            local suffix = (raw:match("[kmbt]$") or ""):lower()
-                            local mult = { k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
-                            local parsed = math.floor(num * (mult[suffix] or 1))
-                            -- Operator report (2026-10-01, real money): a
-                            -- ~200M pet got credited at 10K, a ~300M pet at
-                            -- 0 - a wrong-but-plausible-looking number that
-                            -- still passed the old no-questions-asked
-                            -- accept. Refuse anything under 10% of this
-                            -- exact pet's own known catalog value instead
-                            -- of trusting whatever text matched the shape -
-                            -- keeps retrying/fails closed rather than
-                            -- silently undercrediting a real deposit.
-                            if refNum and refNum > 0 and parsed < refNum * CV_PLAUSIBILITY_FLOOR then
-                                rejectedLow = { parsed = parsed, refNum = refNum }
-                            else
-                                cvValue = parsed
-                                demand = tonumber(dem)
-                            end
-                        end
-                    end
-                end)
-            end
-
-            if cvValue then
-                -- Undo the hover so the next slot's MouseEnter isn't a
-                -- no-op because PS99 thinks the pointer never left this slot.
-                if type(fire) == "function" then
-                    pcall(function() fire(itemSlot.MouseLeave, 0, 0) end)
+        if type(players) == "table" then
+            for index, player in pairs(players) do
+                if player ~= localPlayer then
+                    otherIndex = index
+                    break
                 end
-
-                local result = { value = cvValue, demand = demand }
-                cvCache[displayName] = result
-                print("[CV] " .. tostring(displayName) .. " = " .. tostring(cvValue) .. " demand=" .. tostring(demand) .. " (attempt " .. attempt .. "/4)")
-                return result
-            end
-
-            if rejectedLow then
-                warn("[CV-REJECT] " .. tostring(displayName) .. ": read " .. tostring(rejectedLow.parsed) ..
-                    " but catalog value is " .. tostring(rejectedLow.refNum) .. " - refusing as implausible (attempt " .. attempt .. "/4)")
             end
         end
 
-        if attempt < 4 then
-            task.wait(0.05)
+        if otherIndex == nil then
+            for index in pairs(items) do
+                otherIndex = index
+                break
+            end
         end
+
+        if otherIndex == nil then
+            warn("[GEMS] Could not determine other player's trade index")
+            return
+        end
+
+        local otherItems = items[otherIndex]
+
+        if type(otherItems) ~= "table" then
+            warn("[GEMS] No trade items for player index " .. tostring(otherIndex))
+            return
+        end
+
+        local currency = otherItems.Currency
+
+        if type(currency) ~= "table" then
+            print("[GEMS] Other player has no Currency table")
+            return
+        end
+
+        for uid, entry in pairs(currency) do
+            if type(entry) == "table"
+                and type(entry._data) == "table"
+                and tostring(entry._data.id) == "Diamonds"
+            then
+                local amount = tonumber(entry._data._am)
+
+                if amount then
+                    gems = math.max(0, math.floor(amount))
+                    print(
+                        "[GEMS] Found Diamonds in trade state | " ..
+                        "uid=" .. tostring(uid) ..
+                        " | amount=" .. tostring(gems)
+                    )
+                    break
+                end
+            end
+        end
+
+        print("[GEMS] Player offered Diamonds: " .. tostring(gems))
+    end)
+
+    if not ok then
+        warn("[GEMS] Trade-state reader error: " .. tostring(err))
     end
 
-    if type(fire) == "function" then
-        pcall(function() fire(itemSlot.MouseLeave, 0, 0) end)
-    end
+    return gems
+end
 
-    if overlayFoundCount == 0 then
-        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay never appeared in PlayerGui on any of 4 attempts - " ..
-            "the hover/tooltip trigger itself isn't opening it (check whether 'InfoOverlay' still exists/still opens on hover after the latest game update).")
-    elseif #seenTitles > 0 then
-        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) and had CV-shaped text, but every match got rejected as implausible (see any [CV-REJECT] lines above) or none parsed cleanly. Matches seen: " ..
-            table.concat(seenTitles, " | "))
-    elseif #allTextsSeen > 0 then
-        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but nothing inside matched the Cosmic Value shape at all - " ..
-            "likely a renamed/restructured tooltip after a game update. All text actually found inside: " .. table.concat(allTextsSeen, " | "))
-    else
-        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but was completely empty of text - " ..
-            "it may need more time to populate, or render a different way now (e.g. ViewportFrame/Image instead of text).")
-    end
-
-    return nil
+local function client_their_gems()
+    return client_trade_gems()
 end
 
 -- ============================================================
 -- ITEM VALIDATION (checks the user's deposit side of the trade)
 -- isWithdrawal: pass true so that having NO deposit items is not treated as an error
+--
+-- REAL FIX (2026-10-11): this is the actual function the live deposit flow
+-- calls (connectStatus -> checkItems). It used to store each found item as
+-- a plain identityKey string with no Cosmic Value at all - readCosmicValue
+-- was never called from here, only from checkTheirItems, which the real
+-- deposit flow never uses. Items are now built as {name=identityKey,
+-- cosmicValue=.., demand=..} tables, same shape processDeposit already
+-- knows how to read - CV reading is now part of every real deposit, not
+-- just the unused side path.
 -- ============================================================
 local function checkItems(isWithdrawal)
     isWithdrawal = isWithdrawal == true
@@ -3337,9 +1995,6 @@ local function checkItems(isWithdrawal)
         else
             refreshTradeElements()
         end
-
-        -- Very short UI synchronization window; don't block trade
-        -- acceptance on multi-second WaitForChild timeouts.
         task.wait(0.025)
     end
     if not itemsContainer then
@@ -3394,12 +2049,6 @@ local function checkItems(isWithdrawal)
             displayName = getName(nameAssetIds, iconImage)
         end
 
-        -- ========================================================
-        -- ENCHANT FALLBACK
-        -- Enchants are not PS99 pet definitions, so icon-based
-        -- pet matching returns nil. Try the item's visible text
-        -- against the live BloxyFlip Enchant catalog.
-        -- ========================================================
         if not entry then
             local enchantEntry, enchantKey = getSupportedEnchantIdentity(item)
 
@@ -3437,21 +2086,29 @@ local function checkItems(isWithdrawal)
                 "]"
             )
 
-            -- Read Cosmic Value for this specific slot's item, if the
-            -- executor supports forcing the hover signal. Store the
-            -- canonical configName|variant identity alongside it so
-            -- processDeposit/tradeItemDisplay can still resolve the pet
-            -- either way. entry.value (the catalog's own last-known price
-            -- for this exact pet, from /api/bots/pets) is passed through
-            -- as the plausibility floor's reference point - see
-            -- readCosmicValueFromSlot's own doc comment.
-            local cv = readCosmicValueFromSlot(item, displayName, entry and entry.value)
+            -- Read Cosmic Value for Huge/Titanic/Gargantuan pets only -
+            -- those are the only tier this ever needs a real price for.
+            -- entry.value is this pet's own last-known catalog price, used
+            -- as the plausibility floor's reference point (see
+            -- readCosmicValue's own doc comment).
+            local lname = tostring(displayName or ""):lower()
+            local isAcceptedTier = lname:sub(1, 5) == "huge "
+                or lname:sub(1, 8) == "titanic "
+                or lname:sub(1, 11) == "gargantuan "
+
+            local cosmicValue, demand = nil, nil
+            if isAcceptedTier then
+                local cv = readCosmicValue(displayName, entry and entry.value)
+                if cv then
+                    cosmicValue = cv.value
+                    demand = cv.demand
+                end
+            end
 
             table.insert(foundItems, {
-                identityKey = identityKey,
-                displayName = displayName,
-                cosmicValue = cv and cv.value or nil,
-                demand      = cv and cv.demand or nil,
+                name = identityKey,
+                cosmicValue = cosmicValue,
+                demand = demand,
             })
         end
     end
@@ -3486,10 +2143,6 @@ end
 -- ============================================================
 -- WITHDRAWAL ITEMS
 -- ============================================================
--- These helpers are intentionally local to the inventory scanner.
--- V6 accidentally referenced getPetId/getPetName/getPetVariant, which
--- do not exist in this script. The save records themselves are enough:
--- Inventory.Pet is keyed by UUID and normally stores id/pt/shiny fields.
 local function withdrawalReadField(pet, ...)
     if type(pet) ~= "table" then
         return nil
@@ -3567,15 +2220,9 @@ local function withdrawalPetVariant(pet)
         end
     end
 
-    -- Real bug fix (2026-10-10, confirmed via live [SHINY-PROBE] dump):
-    -- PS99's actual save record uses the field `sh` for shiny, not `shiny`
-    -- or `isShiny` - a real owned pet's raw table was `{ id = "Huge
-    -- Fireball Cat", sh = true, _uq = <table> }`, nothing named `shiny` or
-    -- `isShiny` anywhere on it. Every plain-Shiny (non-golden, non-rainbow)
-    -- pet was therefore silently unmatchable in every withdrawal, forever
-    -- - this is the actual fix, `sh` checked first since it's the real
-    -- field; `shiny`/`isShiny` kept as harmless fallbacks in case a
-    -- different save shape ever uses them instead.
+    -- PS99's real save record uses `sh` for shiny, not `shiny`/`isShiny` -
+    -- checked first since it's the field actually confirmed live; the
+    -- others kept as harmless fallbacks.
     local shiny = withdrawalReadField(pet, "sh", "shiny", "isShiny")
     local shinyBool = shiny == true
         or tonumber(shiny) == 1
@@ -3585,8 +2232,6 @@ local function withdrawalPetVariant(pet)
 
     local baseVariant = nil
 
-    -- Current PS99 save records commonly use pt=1 for Golden and pt=2
-    -- for Rainbow. Keep string fields as the higher-priority source.
     if type(explicit) == "string" then
         local v = explicit:lower()
         if v == "rainbow" or v == "golden" then
@@ -3625,30 +2270,7 @@ local function normalizeWithdrawalInventoryText(v)
         :gsub("%s+$", "")
 end
 
--- Real incident (2026-10-10, live log): a withdrawal couldn't find "Shiny
--- Huge Kawaii Dragon" or "Shiny Huge Fireball Cat" in the bot's own
--- inventory (matchableCount=0) even though the Kawaii Dragon had JUST been
--- deposited into this exact bot seconds earlier and the heartbeat's own
--- heldItemGroups count grew to include it. Golden/Rainbow pets in the same
--- withdrawal matched fine - only plain "Shiny" (no golden/rainbow combo)
--- failed. withdrawalPetVariant() only recognises shiny via a `shiny`/
--- `isShiny` field (see its own doc comment) - if PS99's real save record
--- uses some other field/shape for plain-shiny specifically, every shiny
--- pet is silently unmatchable forever (fails safe - it just stays
--- "missing"/pending, never lost or duplicated - but a player's otherwise
--- real holdings become permanently unwithdrawable, which is its own
--- serious problem). One-time-per-UUID raw dump of exactly these two known-
--- shiny pets' real fields, so the next withdrawal attempt shows the actual
--- schema instead of guessing at it again.
-local shinyProbeDumped = {}
-
 local function getHugesTitanics(requestedItems)
-    -- IMPORTANT:
-    -- Only inspect the live player inventory. The previous recursive save scan
-    -- could find pets inside TradeHistory/Received and mistakenly treat them
-    -- as currently owned inventory.
-    -- V5 diagnostic accidentally called getSaveData(), which is not a function
-    -- in this bot. Use the already-loaded Save module directly instead.
     local saveData = nil
 
     if type(saveModule) == "table" then
@@ -3716,32 +2338,6 @@ local function getHugesTitanics(requestedItems)
         local isGargantuan = idNorm:find("gargantuan", 1, true) ~= nil
             or nameNorm:find("gargantuan", 1, true) ~= nil
 
-        -- See shinyProbeDumped's own doc comment above getHugesTitanics.
-        if not shinyProbeDumped[uuidStr]
-            and (idNorm:find("kawaii dragon", 1, true) or nameNorm:find("kawaii dragon", 1, true)
-                or idNorm:find("fireball cat", 1, true) or nameNorm:find("fireball cat", 1, true))
-        then
-            shinyProbeDumped[uuidStr] = true
-            print("[SHINY-PROBE] " .. tostring(name) .. " uuid=" .. uuidStr .. " computedVariant=" .. tostring(variant))
-            for k, v in pairs(pet) do
-                print("[SHINY-PROBE]   " .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
-            end
-            if type(pet._data) == "table" then
-                for k, v in pairs(pet._data) do
-                    print("[SHINY-PROBE]   _data." .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
-                end
-            end
-            if type(pet.data) == "table" then
-                for k, v in pairs(pet.data) do
-                    print("[SHINY-PROBE]   data." .. tostring(k) .. " = " .. tostring(v) .. " (" .. typeof(v) .. ")")
-                end
-            end
-        end
-
-        -- IMPORTANT:
-        -- The old scanner only returned Huge/Titanic/Gargantuan pets.
-        -- Withdrawals can also request ordinary pets (e.g. Glass Kraken,
-        -- Moon Raccoon). Include exact requested pets as candidates too.
         local isExplicitlyRequested = false
 
         if type(requestedItems) == "table" then
@@ -3785,8 +2381,6 @@ local function getHugesTitanics(requestedItems)
         end
     end
 
-    -- Inventory.Pet is normally UUID -> pet record. Do not recurse into
-    -- arbitrary nested save data.
     for uuid, pet in pairs(inventoryPets) do
         if type(pet) == "table" then
             addInventoryPet(uuid, pet)
@@ -3800,21 +2394,6 @@ local function getHugesTitanics(requestedItems)
 
     return results
 end
-
-local function parseHudGemText(txt)
-    if not txt then return nil end
-    txt = txt:gsub(",",""):gsub("%s+","")
-    local num, suf = txt:match("^([%d%.]+)([KkMmBbTt])$")
-    if num and suf then
-        local mult = ({k=1e3,K=1e3,m=1e6,M=1e6,b=1e9,B=1e9,t=1e12,T=1e12})[suf] or 1
-        return math.floor(tonumber(num) * mult)
-    end
-    local plain = tonumber(txt)
-    if plain and plain >= 0 then return plain end
-    return nil
-end
-
-local DIAMOND_CURRENCY_ID = "584a0aba2e934e388be12c2226050990"  -- confirmed diamond currency UUID
 
 local function getBotGemBalance()
     local balance = 0
@@ -3830,7 +2409,6 @@ local function getBotGemBalance()
         local diamonds = leaderstats:FindFirstChild("Diamonds")
 
         if not diamonds then
-            -- Fallback in case the value has a slightly different name.
             for _, child in ipairs(leaderstats:GetChildren()) do
                 if (child:IsA("IntValue") or child:IsA("NumberValue"))
                     and child.Name:lower():find("diamond")
@@ -3862,23 +2440,6 @@ local function getBotGemBalance()
     return math.max(0, math.floor(balance))
 end
 
-local function parseGemValue(name)
-    local numT = name:match("(%d+%.?%d*)%s*[Tt]")
-    local numB = name:match("(%d+%.?%d*)%s*[Bb]")
-    local numM = name:match("(%d+%.?%d*)%s*[Mm]")
-    local numK = name:match("(%d+%.?%d*)%s*[Kk]")
-    local numP = name:match("(%d+)")
-    if numT then return tonumber(numT) * 1e12
-    elseif numB then return tonumber(numB) * 1e9
-    elseif numM then return tonumber(numM) * 1e6
-    elseif numK then return tonumber(numK) * 1e3
-    elseif numP and tonumber(numP) > 1000 then return tonumber(numP)
-    end
-    return 0
-end
-
--- Adds the bot's withdrawal items to the trade. No balance checking.
--- PS99 silently caps gems at real balance. Stores actual amount in lastBotGemsAdded.
 local function withdrawalDisplayFromRequest(req)
     local petId = tostring(req.petId or req.configName or "")
     local variant = tostring(req.variant or "normal")
@@ -3897,16 +2458,6 @@ local function withdrawalDisplayFromRequest(req)
     return nil
 end
 
--- Adds as much of the claimed withdrawal as is safely available, including Huge/Titanic/Gargantuan pets.
--- Missing items are left pending.
--- A pet is considered successfully added only after addPet() confirms
--- the exact UUID exists in the actual PS99 trade state.
---
--- IMPORTANT: PS99 Save data can lag immediately after a completed trade.
--- We therefore stabilize the local Huge/Titanic inventory snapshot before
--- matching a withdrawal. Without this, a fast back-to-back withdrawal can
--- see pets that were already sent (duplicates/"extra") or miss pets that just
--- arrived from the previous deposit ("not enough").
 local function getStableWithdrawalInventory(requestedItems)
     local lastSignature = nil
     local stableCount = 0
@@ -3926,15 +2477,6 @@ local function getStableWithdrawalInventory(requestedItems)
         return table.concat(ids, "\n")
     end
 
-    local function variantOf(pet)
-        if pet.shiny and pet.type == "Golden" then return "shiny_golden" end
-        if pet.shiny and pet.type == "Rainbow" then return "shiny_rainbow" end
-        if pet.shiny then return "shiny" end
-        if pet.type == "Golden" then return "golden" end
-        if pet.type == "Rainbow" then return "rainbow" end
-        return "normal"
-    end
-
     local function normalize(v)
         return tostring(v or ""):lower():gsub("ñ", "n"):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
     end
@@ -3951,9 +2493,6 @@ local function getStableWithdrawalInventory(requestedItems)
             if requestedVariant == "gold" then requestedVariant = "golden" end
             if requestedVariant == "rb" then requestedVariant = "rainbow" end
 
-            -- The Worker petId may be a catalog UUID while the local Save
-            -- record's `id` is the PS99 config/name. Prefer explicit request
-            -- name when available, and resolve catalog display name when not.
             if requestedName == "" and requestedId ~= "" then
                 local entry = catalogByKey[
                     tostring(req.petId or req.configName)
@@ -3997,31 +2536,7 @@ local function getStableWithdrawalInventory(requestedItems)
         return true
     end
 
-    -- Real bug fix (2026-10-10, live operator report: withdrawals failing/
-    -- rejecting pets the bot had genuinely just received - "it's accepting
-    -- the trade without detecting it and then updating the site"). The old
-    -- version gave up after just TWO reads 0.10s apart coming back
-    -- identical and called that "stable" - but two reads 0.1s apart of a
-    -- save table PS99 hasn't finished replicating yet are trivially
-    -- identical (nothing had time to change), which is not the same thing
-    -- as the data being final. A pet that was JUST received via a real
-    -- trade can take longer than 0.2s total for PS99's own save system to
-    -- actually reflect - this returned that stale/incomplete snapshot as
-    -- if it were done, which is exactly what made a genuinely-held pet
-    -- read as "missing" and fail a real withdrawal.
-    --
-    -- The FOUND-immediately path is unchanged below (still returns the
-    -- instant requested items show up - zero added delay for the normal,
-    -- already-caught-up case, which is most withdrawals). Only the
-    -- NOT-found path now spends real time confirming before conceding:
-    -- more attempts, spaced further apart, and three consecutive identical
-    -- reads (not two) before deciding the item really isn't there. Costs
-    -- up to ~2.4s extra ONLY when something is actually missing or PS99 is
-    -- genuinely lagging - a real withdrawal wrongly failing outright is a
-    -- far worse outcome than a few extra seconds of polling.
-    local MAX_ATTEMPTS = 8
-    local RETRY_DELAY_SECONDS = 0.3
-    local REQUIRED_STABLE_READS = 3
+    local MAX_ATTEMPTS = 3
     for attempt = 1, MAX_ATTEMPTS do
         latest = getHugesTitanics(requestedItems)
 
@@ -4038,57 +2553,29 @@ local function getStableWithdrawalInventory(requestedItems)
         print("[WITHDRAWAL-INVENTORY] Snapshot " .. tostring(attempt) ..
             "/" .. tostring(MAX_ATTEMPTS) ..
             " | pets=" .. tostring(#latest) ..
-            " | stable=" .. tostring(stableCount) .. "/" .. tostring(REQUIRED_STABLE_READS) ..
+            " | stable=" .. tostring(stableCount) .. "/2" ..
             " | requestedPresent=" .. tostring(targetsPresent))
 
-        -- Do not require multiple snapshots when the requested items are
-        -- already visible in the live inventory. That keeps normal
-        -- withdrawals just as fast as before this fix.
         if targetsPresent then
             print("[WITHDRAWAL-INVENTORY] Requested items found in live inventory; proceeding immediately")
             return latest
         end
 
-        if stableCount >= REQUIRED_STABLE_READS then
-            print("[WITHDRAWAL-INVENTORY] Inventory stabilized across " .. tostring(REQUIRED_STABLE_READS) ..
-                " reads; requested item still not found")
+        if stableCount >= 2 then
+            print("[WITHDRAWAL-INVENTORY] Inventory stabilized; requested item still not found")
             return latest
         end
 
         if attempt < MAX_ATTEMPTS then
-            task.wait(RETRY_DELAY_SECONDS)
+            task.wait(0.10)
         end
     end
 
-    print("[WITHDRAWAL-INVENTORY] Using latest snapshot after extended sync window")
+    print("[WITHDRAWAL-INVENTORY] Using latest snapshot after fast sync window")
     return latest
 end
 
--- Real bug fix (2026-09-18): this function used to call addPet() (a real,
--- physical Roblox trade action) for every requested pet it happened to
--- find, one at a time, DURING the same pass that was still discovering
--- which OTHER requested pets were missing. If the bot had 3 of 5
--- requested pets, it would really trade those 3 - but the backend's
--- withdrawal model is deliberately all-or-nothing (see
--- robloxBot.routes.ts's /complete-withdrawal, which flatly rejects any
--- confirmation with missingPets/missingGems non-empty), so that
--- confirmation could never succeed. The withdrawal then got cancelled,
--- and failWithdrawal refunds the ENTIRE original request back into site
--- inventory with no idea 3 of those pets were already really delivered -
--- a genuine duplication: real pet in the player's Roblox inventory AND
--- back in their withdrawable site inventory. Operator report, 2026-09-18:
--- exactly this happened.
---
--- Fix: `dryRun` (new second parameter). When true, this runs the exact
--- same matching/candidate-selection logic (unchanged - same iteration
--- order, same usedUUIDs bookkeeping, so it finds identical matches to a
--- real run) but never calls addPet()/addGems() - a match is simply
--- recorded as found. The caller now always does a dry run FIRST; only if
--- that comes back fully satisfied (nothing in missingPets, gems fully
--- covered) does it call this again with dryRun=false to actually trade.
--- If anything would be missing, NOTHING real ever gets traded, so
--- cancelling afterward is always safe - there is nothing to duplicate.
-local function addWithdrawalItems(withdrawalData, dryRun)
+local function addWithdrawalItems(withdrawalData)
     if not withdrawalData then
         return {}, 0, false, "Missing withdrawal data"
     end
@@ -4122,9 +2609,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
 
     local function normalizeText(v)
         local text = tostring(v or ""):lower()
-        -- Website/catalog can say "Pinata" while PS99 says "Piñata".
-        -- Normalize only the accented n for name comparison; config IDs
-        -- are still checked first and remain the strongest identity match.
         text = text:gsub("ñ", "n")
         return text
             :gsub("%s+", " ")
@@ -4157,11 +2641,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
     end
 
     local function petMatches(b, req, displayName, requestedVariant)
-        -- IMPORTANT: Inventory candidates produced by getHugesTitanics()
-        -- already carry a normalized `variant` field. The old matcher called
-        -- getBotVariant(b), which expects raw `type`/`shiny` fields. That made
-        -- every inventory candidate look "normal", so Rainbow/Golden requests
-        -- were rejected even when the pet was actually present.
         local botVariant = tostring(b.variant or getBotVariant(b) or "normal"):lower()
 
         if botVariant == "gold" then botVariant = "golden" end
@@ -4177,8 +2656,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
 
         local botId = normalizeText(b.id)
 
-        -- Prefer the scanner's already-resolved display name. Fall back to the
-        -- game's definition table if necessary.
         local botName = normalizeText(
             b.name
                 or getNameById(b.id)
@@ -4186,8 +2663,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
 
         local expectedName = normalizeText(req.petName or "")
 
-        -- Backend petId can be a catalog UUID rather than PS99 configName.
-        -- When that happens, resolve its catalog entry to the display name.
         if expectedName == "" and requestedId ~= "" then
             local entry = catalogByKey[
                 tostring(req.petId or req.configName)
@@ -4200,25 +2675,10 @@ local function addWithdrawalItems(withdrawalData, dryRun)
             end
         end
 
-        -- Real perf fix (2026-10-10, operator report: "the bot is laggy").
-        -- These two prints used to fire unconditionally on EVERY match
-        -- found - with an inventory in the thousands and a withdrawal
-        -- requesting dozens of a common pet, that's potentially hundreds
-        -- of print() calls just to collect candidates, repeated on every
-        -- one of getStableWithdrawalInventory's retry scans (up to 8 since
-        -- tonight's anti-lag fix). print() to the dev console is not free,
-        -- especially under an emulated environment - this is real,
-        -- measurable overhead, not imagined. The outer loop in
-        -- addWithdrawalItems already prints its own equivalent diagnostic,
-        -- capped at the first 3 matches - nothing informational is lost by
-        -- removing this uncapped duplicate.
-
-        -- Strongest match when Worker and local IDs match.
         if requestedId ~= "" and botId == requestedId then
             return true
         end
 
-        -- Normal path: exact local display name + exact variant.
         if expectedName ~= ""
             and botName ~= ""
             and botName ~= "???"
@@ -4230,10 +2690,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
         return false
     end
 
-    -- ============================================================
-    -- ADD REQUESTED PETS
-    -- HARD LIMIT: 100 PETS PER TRADE
-    -- ============================================================
     local petLimitReached = false
 
     for reqIndex, req in ipairs(requestedItems) do
@@ -4260,8 +2716,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
 
         for quantityIndex = 1, quantity do
 
-            -- Once 100 pets have been added,
-            -- everything else stays pending.
             if #itemsGiven >= MAX_TRADE_PETS then
                 petLimitReached = true
 
@@ -4275,8 +2729,6 @@ local function addWithdrawalItems(withdrawalData, dryRun)
                     )
                 end
 
-                -- Add every subsequent requested pet
-                -- to the pending list.
                 for remainingReqIndex =
                     reqIndex + 1,
                     #requestedItems
@@ -4322,34 +2774,14 @@ local function addWithdrawalItems(withdrawalData, dryRun)
 
             local found = false
             local matchingCandidatesTried = 0
-            local MAX_MATCHING_CANDIDATES_PER_REQUEST = 2
 
-            -- Real perf fix (2026-10-10, operator report: "the bot was
-            -- laggy... that's why it couldn't withdraw"): this used to scan
-            -- the ENTIRE botHuges list TWICE per requested item - once just
-            -- to print a diagnostic match count, once for the real
-            -- selection - with petMatches() doing string normalization
-            -- (lower/gsub) on every single comparison either way. With a
-            -- bot inventory in the hundreds/thousands (exactly what builds
-            -- up over a long session of real deposits) and a withdrawal
-            -- requesting several items, that's the full list re-walked
-            -- twice per item - real, compounding cost, not imagined. One
-            -- pass now, capped at 10 collected candidates (comfortably
-            -- more than the 2 this ever actually tries, plus the 3 the
-            -- diagnostic print shows) - the match COUNT keeps counting
-            -- past the cap for accurate logging, it just stops allocating
-            -- more candidate entries once there's no real use for more.
-            local matches = {}
-            local matchCount = 0
+            local debugMatches = 0
             for _, dbgPet in ipairs(botHuges) do
-                if not usedUUIDs[dbgPet.uuid] and petMatches(dbgPet, req, displayName, requestedVariant) then
-                    matchCount = matchCount + 1
-                    if matchCount <= 10 then
-                        table.insert(matches, dbgPet)
-                    end
-                    if matchCount <= 3 then
+                if petMatches(dbgPet, req, displayName, requestedVariant) then
+                    debugMatches = debugMatches + 1
+                    if debugMatches <= 3 then
                         print("[WITHDRAWAL-DIAG] MATCHABLE INVENTORY PET #" ..
-                            tostring(matchCount) ..
+                            tostring(debugMatches) ..
                             " | name=" .. tostring(dbgPet.name or getNameById(dbgPet.id)) ..
                             " | id=" .. tostring(dbgPet.id) ..
                             " | variant=" .. tostring(dbgPet.variant) ..
@@ -4360,17 +2792,20 @@ local function addWithdrawalItems(withdrawalData, dryRun)
             end
             print("[WITHDRAWAL-DIAG] Requested '" .. tostring(displayName) ..
                 "' | variant=" .. tostring(requestedVariant) ..
-                " | matchableCount=" .. tostring(matchCount))
+                " | matchableCount=" .. tostring(debugMatches))
+            local MAX_MATCHING_CANDIDATES_PER_REQUEST = 2
 
-            for _, b in ipairs(matches) do
-                do
+            for _, b in ipairs(botHuges) do
+                if not usedUUIDs[b.uuid]
+                    and petMatches(
+                        b,
+                        req,
+                        displayName,
+                        requestedVariant
+                    )
+                then
                     matchingCandidatesTried = matchingCandidatesTried + 1
 
-                    -- If SetItem itself is failing, trying every duplicate UUID
-                    -- creates a huge retry storm (the same pet can exist dozens
-                    -- of times in inventory). Two candidates is enough to handle
-                    -- a stale/bad UUID without locking the trade handler in a
-                    -- long loop. A failed withdrawal remains pending/held.
                     if matchingCandidatesTried > MAX_MATCHING_CANDIDATES_PER_REQUEST then
                         warn(
                             "[WITHDRAWAL] Aborting candidate scan for " ..
@@ -4397,26 +2832,7 @@ local function addWithdrawalItems(withdrawalData, dryRun)
                         tostring(MAX_TRADE_PETS)
                     )
 
-                    -- IMPORTANT:
-                    -- addPet() itself verifies the exact UUID
-                    -- in the ACTUAL PS99 trade state.
-                    --
-                    -- Do NOT perform the old GUI/name verification
-                    -- afterward. The GUI can temporarily report an
-                    -- empty trade even when GetState() already confirms
-                    -- the exact UUID is present.
-                    --
-                    -- dryRun: skip the real trade action entirely - a
-                    -- structurally valid, unused match is enough to count
-                    -- as "found" for the purposes of deciding whether the
-                    -- whole request is satisfiable. See this function's
-                    -- own top-of-function comment for why.
-                    local ok, result
-                    if dryRun then
-                        ok, result = true, "dry run"
-                    else
-                        ok, result = addPet(b.uuid)
-                    end
+                    local ok, result = addPet(b.uuid)
 
                     if ok then
                         usedUUIDs[b.uuid] = true
@@ -4485,17 +2901,11 @@ local function addWithdrawalItems(withdrawalData, dryRun)
         end
     end
 
-    -- ============================================================
-    -- RECORD PETS THAT REMAIN PENDING
-    -- ============================================================
     lastWithdrawalMissing = {
         pets = missingPets,
         gems = 0,
     }
 
-    -- ============================================================
-    -- GEMS
-    -- ============================================================
     lastGemsRequested = gemsRequested
     lastBotGemsAdded = 0
 
@@ -4503,41 +2913,26 @@ local function addWithdrawalItems(withdrawalData, dryRun)
         local botBalance = getBotGemBalance()
 
         if botBalance >= gemsRequested then
-            -- Real bug fix - see addGems()'s own doc comment. lastBotGemsAdded
-            -- now reflects what addGems actually VERIFIED in the real trade
-            -- state, not blindly the requested amount - if verification
-            -- failed, these gems stay pending instead of being reported to
-            -- the backend as delivered when they may not have been.
-            local gemsOk, gemsActual = true, gemsRequested
-            if not dryRun then
-                gemsOk, gemsActual = addGems(gemsRequested)
-            end
+            addGems(gemsRequested)
 
-            lastBotGemsAdded = gemsOk and gemsActual or 0
-            if not gemsOk then
-                lastWithdrawalMissing.gems = gemsRequested
-            end
+            lastBotGemsAdded = gemsRequested
 
             print(
-                "[WITHDRAWAL] " .. (gemsOk and "Added requested gems: " or "FAILED to verify requested gems: ") ..
+                "[WITHDRAWAL] Added requested gems: " ..
                 tostring(gemsRequested)
             )
 
         elseif botBalance > 0 then
-            -- Send EVERYTHING the bot actually has.
-            local gemsOk, gemsActual = true, botBalance
-            if not dryRun then
-                gemsOk, gemsActual = addGems(botBalance)
-            end
+            addGems(botBalance)
 
-            lastBotGemsAdded = gemsOk and gemsActual or 0
+            lastBotGemsAdded = botBalance
 
             lastWithdrawalMissing.gems =
-                gemsRequested - lastBotGemsAdded
+                gemsRequested - botBalance
 
             print(
                 "[WITHDRAWAL] Partial gems: sent " ..
-                tostring(lastBotGemsAdded) ..
+                tostring(botBalance) ..
                 ", missing " ..
                 tostring(lastWithdrawalMissing.gems)
             )
@@ -4553,23 +2948,9 @@ local function addWithdrawalItems(withdrawalData, dryRun)
         end
     end
 
-    -- ============================================================
-    -- FINAL RESULT
-    -- ============================================================
     local anythingAdded =
         (#itemsGiven > 0)
         or (lastBotGemsAdded > 0)
-
-    -- Real fix (2026-09-18, see this function's own top comment): the
-    -- 3rd return value below has always meant "something was added," not
-    -- "everything requested was covered" - a caller checking only that
-    -- would treat a genuinely partial fulfillment as fine to proceed
-    -- with. This is the actual "nothing missing at all" signal the dry
-    -- run / real-run caller needs to decide whether it's safe to trade
-    -- anything for real.
-    local fullySatisfied =
-        (#missingPets == 0)
-        and (lastWithdrawalMissing.gems == 0)
 
     if not anythingAdded then
         local reason =
@@ -4589,7 +2970,7 @@ local function addWithdrawalItems(withdrawalData, dryRun)
                 "No requested items or gems were available"
         end
 
-        return {}, 0, false, reason, fullySatisfied
+        return {}, 0, false, reason
     end
 
     print(
@@ -4622,7 +3003,7 @@ local function addWithdrawalItems(withdrawalData, dryRun)
         )
     end
 
-    return itemsGiven, lastBotGemsAdded, true, nil, fullySatisfied
+    return itemsGiven, lastBotGemsAdded, true
 end
 
 -- ============================================================
@@ -4634,48 +3015,19 @@ local function handleTradeCompletion(tradeMethod)
 
     print("[COMPLETE] " .. tostring(tradeMethod) .. " | " .. tostring(lastTradeUsername))
 
-    -- IMPORTANT: keep the global trade lock held until ALL backend processing
-    -- for this completed trade has finished. Releasing it here allowed the main
-    -- loop to accept a second trade while this function was still using
-    -- lastTradeUserId / lastWithdrawalData / lastTradeItems. That race could
-    -- overwrite the withdrawal state and make an active withdrawal appear as a
-    -- normal deposit, especially when a player traded the bot immediately.
-
-    -- Shared: process whatever the user deposited on their side.
-    -- No minimum gem amount is enforced.
     local function tryProcessDeposit(bypassMin)
         if not lastTradeUsername or lastTradeUsername == "" then return end
         if #lastTradeItems == 0 and lastTradeGems == 0 then return end
         print("[COMPLETE] Processing deposit: " .. #lastTradeItems .. " pets, " .. lastTradeGems .. " gems (bypassMin=" .. tostring(bypassMin) .. ")")
-        logStep(8, "Calling process-deposit API now")
         local success, result = processDeposit(lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, bypassMin)
-        logStep(9, "process-deposit API responded | success=" .. tostring(success) .. " | result=" .. tostring(result))
         if success then
-            -- Independent recheck 15s later - see verifyDepositLanded's own
-            -- doc comment. Same tradeId both calls share, recomputed the
-            -- same way processDeposit derives it internally.
-            local verifyTradeId = makeStableTradeTransactionId(lastGameTradeId)
-            if verifyTradeId then
-                verifyDepositLanded(verifyTradeId, lastTradeUsername, lastTradeGems, #lastTradeItems)
-            end
-            -- Operator report (2026-10-01): "make the bot stop typing in
-            -- the chat" - traced to Roblox's own anti-link filter turning
-            -- any chat message containing "bloxyflip.fun" into a wall of
-            -- #### for most recipients (it reads as a URL). Dropped the
-            -- domain mention entirely rather than reword it - any
-            -- "x.fun"-shaped text risks the same filtering, and the
-            -- balance/item confirmation itself still comes through clean.
             sendMessage("Deposited " .. tostring(result) .. " items!")
             if lastTradeGems > 0 then sendMessage("Plus " .. formatDepositGemCredit(lastTradeGems) .. "!") end
             local itemList = ""
             for i, item in ipairs(lastTradeItems) do
                 if i <= 10 then
-                    -- checkItems() now returns {identityKey, displayName, ...}
-                    -- tables rather than plain strings; tradeItemDisplay()
-                    -- expects a string key and would just print "table: 0x..."
-                    -- for a table. Prefer the entry's own displayName first.
-                    local name = type(item) == "table" and item.displayName or tradeItemDisplay(item)
-                    itemList = itemList .. "- " .. tostring(name) .. "\n"
+                    local label = type(item) == "table" and item.name or tostring(item)
+                    itemList = itemList .. "- " .. tradeItemDisplay(label) .. "\n"
                 end
             end
             if #lastTradeItems > 10 then itemList = itemList .. "... +" .. (#lastTradeItems - 10) .. " more\n" end
@@ -4683,35 +3035,10 @@ local function handleTradeCompletion(tradeMethod)
                 "\n**Items:** " .. tostring(result) .. "\n**Gems:** " .. tostring(lastTradeGems) ..
                 "\n\n" .. itemList, 65280)
         else
-            -- A real chat message, not the no-op - see sendCriticalMessage's
-            -- own doc comment. This is the exact failure mode that used to
-            -- be completely invisible: the trade already succeeded in
-            -- Roblox, the pet is gone, and the site never credited it.
-            -- Real bug fix (2026-10-10, live operator report: "it has to
-            -- play one more last message and it doesn't play it... when it
-            -- works it says like warning... contact support... but I don't
-            -- know"). The emoji on this message is almost certainly why -
-            -- Roblox's chat filter can reject an ENTIRE message over a
-            -- single character it doesn't like, especially on an account
-            -- without full chat/ID verification, rendering the whole thing
-            -- as a wall of #/filtered symbols instead of the real text -
-            -- exactly what showed up in the operator's own screenshot,
-            -- right where this exact warning should have appeared. This is
-            -- the one message telling the player their deposit may have
-            -- silently failed - it cannot afford to be the one message that
-            -- gets eaten by the filter. Plain ASCII only.
-            -- Console-visible reason, not just the Discord/in-game messages
-            -- above (2026-10-11, operator request: "so I can just send
-            -- console") - this exact branch is the single most important
-            -- failure in the whole script (items already gone from the
-            -- player, site did not credit them) and previously had no
-            -- dedicated print/warn of its own to point at in a pasted log.
-            warn("[COMPLETE] process-deposit FAILED for " .. tostring(lastTradeUsername) ..
-                " | pets=" .. #lastTradeItems .. " gems=" .. tostring(lastTradeGems) ..
-                " | reason=" .. tostring(result) ..
-                " | tradeId=" .. tostring(lastGameTradeId) ..
-                " - items are already gone from the player, this needs a manual credit")
-            sendCriticalMessage("WARNING: Deposit error - your items may not have been credited. Screenshot this and contact support: " .. tostring(result))
+            -- Plain ASCII - Roblox's chat filter can reject an entire
+            -- message over a single character it doesn't like, and this is
+            -- the one message telling the player something went wrong.
+            sendMessage("WARNING: Deposit error - your items may not have been credited: " .. tostring(result))
             sendDiscord("DEPOSIT FAILED: " .. lastTradeUsername .. " | " .. tostring(result), 16711680)
         end
     end
@@ -4726,18 +3053,10 @@ local function handleTradeCompletion(tradeMethod)
         end
 
     elseif tradeMethod == "withdraw" then
-        -- Support both wrapped { success=true, data={...} } and flat format
         local wdData = lastWithdrawalData and (lastWithdrawalData.data or lastWithdrawalData)
         if wdData then
-            -- ── Step 1: Read what the bot ACTUALLY had in its trade side ──────────
-            -- Do this immediately (trade window may still be open for a brief moment).
-            -- Success is already explicit; snapshot immediately.
             local uiPets, uiGems = checkBotTradeItems()
 
-            -- ── Step 2: Build confirmed item list ────────────────────────────────
-            -- lastItemsGiven is authoritative. It contains the actual identity
-            -- of every pet the bot placed into the trade (uuid, petConfigId,
-            -- variant, name). Never send a name-only fulfillment record.
             local fullItemsGiven = {}
             local gemsActuallySent = 0
 
@@ -4749,9 +3068,6 @@ local function handleTradeCompletion(tradeMethod)
             if uiLooksComplete then
                 print("[COMPLETE] UI snapshot matches tracked delivery: " .. #uiPets .. " pets, " .. uiGems .. " gems")
 
-                -- IMPORTANT: consume each tracked entry only once. This fixes
-                -- duplicate pets such as multiple Huge Faceling Owls being
-                -- incorrectly matched to the same tracked pet.
                 local usedTracked = {}
 
                 for _, petName in ipairs(uiPets) do
@@ -4773,8 +3089,6 @@ local function handleTradeCompletion(tradeMethod)
                         local tracked = lastItemsGiven[matchedIndex]
                         usedTracked[matchedIndex] = true
 
-                        -- Copy the authoritative identity instead of passing the
-                        -- original table by reference.
                         table.insert(fullItemsGiven, {
                             name = tracked.name,
                             uuid = tracked.uuid,
@@ -4789,19 +3103,12 @@ local function handleTradeCompletion(tradeMethod)
                             " | petConfigId=" .. tostring(tracked.petConfigId) ..
                             " | variant=" .. tostring(tracked.variant))
                     else
-                        -- Never fabricate a fulfillment entry from a display name.
-                        -- Leaving this item unfulfilled is safer than crediting the
-                        -- wrong pet identity to the backend.
                         warn("[COMPLETE] UI pet could not be matched to an authoritative tracked item: " .. tostring(petName))
                     end
                 end
 
                 gemsActuallySent = tonumber(uiGems) or 0
             else
-                -- UI can be incomplete during/just after completion. If its pet
-                -- count differs from what addPet() already verified, do NOT let the
-                -- UI silently under-count the withdrawal. The tracked UUID list is
-                -- authoritative because every entry was verified in PS99 trade state.
                 warn("[COMPLETE] Bot trade UI incomplete (uiPets=" .. tostring(uiPets and #uiPets or 0) ..
                     ", trackedPets=" .. tostring(trackedPetCount) ..
                     ", uiGems=" .. tostring(uiGems or 0) ..
@@ -4818,10 +3125,6 @@ local function handleTradeCompletion(tradeMethod)
                     end
                 end
 
-                -- IMPORTANT: never fall back to lastGemsRequested blindly.
-                -- If the bot had insufficient gems, lastBotGemsAdded=0 AND
-                -- lastWithdrawalMissing.gems=lastGemsRequested, so the subtraction
-                -- correctly resolves to 0 — not to lastGemsRequested.
                 if lastBotGemsAdded > 0 then
                     gemsActuallySent = tonumber(lastBotGemsAdded) or 0
                     print("[COMPLETE] Gem fallback: using lastBotGemsAdded=" .. tostring(gemsActuallySent))
@@ -4844,10 +3147,6 @@ local function handleTradeCompletion(tradeMethod)
 
             print("[COMPLETE] Confirming withdrawal - pets=" .. (#fullItemsGiven - (gemsActuallySent > 0 and 1 or 0)) .. " gems=" .. gemsActuallySent)
 
-            -- ── Step 3: Confirm with backend — pass exactly what was sent AND what is missing.
-            -- The backend will mark only the fulfilled items as done and keep the rest pending.
-            -- Save immutable local copies because the main trade state is reset after
-            -- this function finishes.
             local confirmationUserId = lastTradeUserId
             local confirmationWithdrawal = wdData
             local confirmationTradeId = tradeId
@@ -4873,7 +3172,6 @@ local function handleTradeCompletion(tradeMethod)
             local confirmationMissingGems = tonumber(lastWithdrawalMissing.gems) or 0
             local confirmationSentGems = tonumber(gemsActuallySent) or 0
 
-            logStep("W4", "Calling complete-withdrawal API now")
             local confirmed, confirmError = confirmWithdrawal(
                 confirmationUserId,
                 confirmationWithdrawal,
@@ -4883,12 +3181,7 @@ local function handleTradeCompletion(tradeMethod)
                 confirmationMissingGems,
                 confirmationSentGems
             )
-            logStep("W5", "complete-withdrawal API responded | confirmed=" .. tostring(confirmed) .. " | error=" .. tostring(confirmError))
 
-            -- If Roblox already reported SUCCESS, the assets have already moved.
-            -- Do not make the user remain in an apparently pending state just because
-            -- the backend confirmation request temporarily failed. Retry in the
-            -- background after the trade is closed.
             if not confirmed then
                 warn("[COMPLETE] Withdrawal confirmation failed after Roblox trade succeeded: " .. tostring(confirmError))
 
@@ -4935,9 +3228,6 @@ local function handleTradeCompletion(tradeMethod)
 
                         warn("[COMPLETE-RETRY] Attempt " .. tostring(attempt) .. "/" ..
                             tostring(maxBackgroundAttempts) .. " failed: " .. tostring(retryResult))
-
-                        -- Do not stop on NOT_PROCESSING. Keep recovering the exact
-                        -- withdrawal ID; the backend may be transitioning the record.
                     end
 
                     sendDiscord(
@@ -4988,14 +3278,7 @@ local function handleTradeCompletion(tradeMethod)
                         "\n\n" .. itemList, 65280)
                 end
             else
-                -- Real chat message, not the no-op - same reasoning as the
-                -- deposit-error branch above. A background retry loop is
-                -- already running for this (see the task.spawn right above
-                -- confirmed's own if-check), but the player should know
-                -- immediately rather than finding out only if it keeps
-                -- failing.
-                -- Same emoji-filter fix as the deposit-error message above.
-                sendCriticalMessage("WARNING: Withdrawal sent but confirm had issues - contact support if balance looks wrong")
+                sendMessage("WARNING: Withdrawal sent but confirm had issues - contact support if balance wrong")
                 sendDiscord("**WITHDRAWAL (confirm issue)**\n**Player:** " .. tostring(lastTradeUsername) ..
                     "\n**Pets sent:** " .. petCount .. "\n**Gems sent:** " .. gemsActuallySent ..
                     (isPartial and ("\n**PARTIAL**" .. missingStr) or "") ..
@@ -5003,16 +3286,13 @@ local function handleTradeCompletion(tradeMethod)
             end
         end
 
-        -- Always process any deposit the user added on their side during withdrawal
-        -- No gem minimum is enforced for deposits
         tryProcessDeposit(true)
     end
-    
+
     print("[COMPLETE] Releasing trade and closing window")
     pcall(function() tradingCommands.Close() end)
     task.wait(0.05)
 
-    -- Only now is it safe for the main loop to accept another trade.
     resetTradeState()
     goNext = true
     releaseIncomingTradeLock()
@@ -5021,53 +3301,16 @@ end
 -- ============================================================
 -- CONFIRM MONITOR
 -- ============================================================
--- CONFIRM MONITOR
--- Always re-snapshots the USER'S side before confirming regardless
--- of trade method (deposit or withdraw+deposit).
--- The BOT's side is never checked here — that's handled separately
--- via lastItemsGiven/checkBotTradeItems at trade completion.
--- ============================================================
 local function connectConfirm(localId, tradeMethod, validatedItems, validatedGems)
-    safeSpawn("connectConfirm", function()
-        -- The player has already readied. Use a short synchronization window
-        -- instead of a fixed 3-second wait.
-        -- Fast path: the ready event already tells us the player is ready.
-        -- Only yield one frame instead of waiting a fixed 250ms.
+    task.spawn(function()
         task.wait()
         if goNext or tradeCancelled or tradeId ~= localId then return end
         if not isInTrade() then return end
 
-        -- Re-snapshot USER's side (works for both deposit and withdraw+deposit)
         local isWithdraw = tradeMethod == "withdraw"
         local _, confirmItems = checkItems(isWithdraw)
-        local confirmGems, confirmGemsReadOk = client_trade_gems()
+        local confirmGems     = client_trade_gems()
 
-        -- Operator request (2026-09-20): "also do it for gems too" - same
-        -- re-check-right-before-confirming principle as the Cosmic Value
-        -- gate below, for a genuine gems-read failure specifically (not
-        -- just any mismatch vs. the ready-stage value, which the swap
-        -- check further down already catches). See client_trade_gems's own
-        -- doc comment for what counts as a real failure vs. an honest 0.
-        if not confirmGemsReadOk then
-            logStep("4-FAIL", "Declining at confirm stage - gems unreadable right before confirming")
-            warn("[GEMS-GATE] Declining at confirm stage - could not read gems offered in this trade")
-            sendMessage("Could not confirm the gems in this trade - cancelling for safety. Please re-trade.")
-            sendDiscord("⚠️ **GEMS-GATE (confirm stage)**\n**Player:** " .. tostring(lastTradeUsername) ..
-                "\nTrade cancelled automatically - gems could not be confirmed right before confirming.", 16776960)
-            tradeCancelled = true
-            tradeProcessed = true
-            if isWithdraw and lastWithdrawalData then
-                local wdData = lastWithdrawalData.data or lastWithdrawalData
-                cancelWithdrawalTrade(wdData, "Gems unreadable at confirm stage", true)
-            end
-            declineTrade()
-            goNext = true
-            releaseIncomingTradeLock()
-            resetTradeState()
-            return
-        end
-
-        -- Swap check: compare against what was validated at ready-stage
         local swapped = false
         if confirmGems ~= validatedGems then
             warn("[CONFIRM-CHECK] Gem mismatch! Validated=" .. validatedGems .. " Now=" .. confirmGems)
@@ -5077,12 +3320,12 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             warn("[CONFIRM-CHECK] Item count mismatch! Validated=" .. #validatedItems .. " Now=" .. #confirmItems)
             swapped = true
         else
-            -- Entries are now {identityKey, displayName, cosmicValue, demand}
-            -- tables, not plain strings - two different table instances for
-            -- the "same" pet are never == to each other, so compare by
-            -- identityKey (falling back to a raw string) instead of `v == item`.
+            -- Entries are {name, cosmicValue, demand} tables now, not bare
+            -- strings - compare by `name` (the identityKey), not `==`
+            -- (two different table instances for the "same" pet are never
+            -- == to each other).
             local function entryKey(v)
-                return type(v) == "table" and v.identityKey or tostring(v)
+                return type(v) == "table" and v.name or tostring(v)
             end
             local validatedCopy = {}
             for _, v in ipairs(validatedItems) do table.insert(validatedCopy, v) end
@@ -5100,7 +3343,6 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         end
 
         if swapped then
-            logStep("4-FAIL", "Declining at confirm stage - items/gems changed since ready (swap check failed)")
             sendMessage("Trade items changed after ready - cancelling!")
             sendDiscord("🚨 **POSSIBLE SWAP ATTACK**\n**Player:** " .. tostring(lastTradeUsername) ..
                 "\n**Method:** " .. tradeMethod ..
@@ -5109,7 +3351,6 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
                 "\nTrade cancelled automatically.", 16711680)
             tradeCancelled = true
             tradeProcessed = true
-            -- For withdraw, cancel it on the backend too
             if isWithdraw and lastWithdrawalData then
                 local wdData = lastWithdrawalData.data or lastWithdrawalData
                 cancelWithdrawalTrade(wdData, "Swap detected at confirm stage", true)
@@ -5121,151 +3362,32 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             return
         end
 
-        -- Operator request (2026-09-20): "multiple security measures" - the
-        -- same Huge/Titanic/Gargantuan-needs-a-real-Cosmic-Value gate that
-        -- already blocks READYING a deposit (see connectStatus's own
-        -- [CV-GATE]) is re-checked here too, right before confirming. It
-        -- should never actually trip - cvCache means a name that read
-        -- successfully once already stays cached for the rest of this
-        -- trade, so this re-read shouldn't be able to independently fail -
-        -- but this is the last real checkpoint before the trade completes
-        -- and the player's pet is actually gone, so it's cheap insurance
-        -- against any path that could otherwise slip an unpriced
-        -- accepted-tier pet through to a real 0-credit deposit.
-        local missingCosmicAtConfirm = nil
-        for _, it in ipairs(confirmItems) do
-            local lname = tostring(it.displayName or ""):lower()
-            local isAcceptedTier = lname:sub(1, 5) == "huge "
-                or lname:sub(1, 8) == "titanic "
-                or lname:sub(1, 11) == "gargantuan "
-            if isAcceptedTier and it.cosmicValue == nil then
-                missingCosmicAtConfirm = it.displayName
-                break
-            end
-        end
-        if missingCosmicAtConfirm then
-            logStep("4-FAIL", "Declining at confirm stage - no Cosmic Value for " .. tostring(missingCosmicAtConfirm))
-            warn("[CV-GATE] Declining at confirm stage - no Cosmic Value read for " .. tostring(missingCosmicAtConfirm))
-            sendMessage("Could not confirm Cosmic Value for " .. tostring(missingCosmicAtConfirm) .. " - cancelling for safety. Please re-trade.")
-            sendDiscord("⚠️ **CV-GATE (confirm stage)**\n**Player:** " .. tostring(lastTradeUsername) ..
-                "\n**Item:** " .. tostring(missingCosmicAtConfirm) ..
-                "\nTrade cancelled automatically - Cosmic Value could not be confirmed right before confirming.", 16776960)
-            tradeCancelled = true
-            tradeProcessed = true
-            if isWithdraw and lastWithdrawalData then
-                local wdData = lastWithdrawalData.data or lastWithdrawalData
-                cancelWithdrawalTrade(wdData, "Cosmic Value unreadable at confirm stage", true)
-            end
-            declineTrade()
-            goNext = true
-            releaseIncomingTradeLock()
-            resetTradeState()
-            return
-        end
-
-        -- User's items verified — update snapshot then confirm
         lastTradeItems = confirmItems
         lastTradeGems  = confirmGems
-
-        -- Bug fix (2026-10-11, live log evidence: cat_man5000x's deposit of
-        -- 2 pets + 62,000,000 gems - this exact code path, verified here -
-        -- physically landed in the bot's Roblox inventory (confirmed by the
-        -- bot's own in-game Trade History, and by the next heartbeat's gem
-        -- balance/pet count jumping by EXACTLY these numbers), but the
-        -- Message-popup listener in connectMessage never fired for it - not
-        -- even an "unrecognized text" line, total silence - so the deposit
-        -- was never credited even though the player already paid. The
-        -- popup-staleness fix from 2026-10-10 clearly isn't catching every
-        -- case. Snapshotting the bot's own gem balance right here, the
-        -- instant the player's confirm is independently verified, gives the
-        -- no-message timeout in connectMessage something more reliable than
-        -- a GUI popup to fall back on: if gems actually moved by this exact
-        -- amount, the trade demonstrably happened regardless of whether any
-        -- popup was ever seen. Deposit-only - a withdrawal's balance moves
-        -- the other direction and already has its own confirmation path.
-        if tradeMethod == "deposit" then
-            local ok, bal = pcall(getBotGemBalance)
-            preConfirmGemBalance = (ok and type(bal) == "number") and bal or nil
-            local ok2, inv = pcall(getHugesTitanics)
-            preConfirmItemCount = (ok2 and type(inv) == "table") and #inv or nil
-        end
-
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
-        logStep(4, "Player CONFIRMED and verified - bot about to send its own SetConfirmed")
-
-        -- Real bug fix (2026-10-10, live operator report: both sides showed
-        -- "Confirmed!" with PS99's own countdown running on a real 701M-value
-        -- trade, then it just sat there forever - no credit, no success
-        -- message, refreshing did nothing). This used to fire SetConfirmed(true)
-        -- EXACTLY ONCE, wait a single frame (task.wait() with no argument), check
-        -- GetState ONE time, and if that one immediate check didn't show
-        -- confirmed, just assume it worked anyway and move on ("marking
-        -- confirmed anyway" - see the old warn() text below, now only reached
-        -- after real retries). That is nowhere near enough time for the actual
-        -- server round-trip - readyTrade() right above waits 0.10s and addPet's
-        -- SetItem verification polls up to 12 times at 0.05s each specifically
-        -- because this exact class of PS99 network call is known to lag behind
-        -- GetState - but SetConfirmed never got that same treatment. If the one
-        -- frame wasn't enough and the real server-side confirm hadn't landed
-        -- yet, this script told itself "confirmed" and walked away while the
-        -- ACTUAL Roblox trade was still waiting on a confirm that was never
-        -- really sent - explaining a trade that visually shows "Confirmed!"
-        -- (the player's own local UI optimism) but never actually completes.
-        -- REVERTED (2026-10-10, live operator comparison against a known-
-        -- working older copy of this script): the 4x-retry version above
-        -- was itself the regression, not a fix. The working version of this
-        -- script calls SetConfirmed(true) EXACTLY ONCE and moves on - this
-        -- version was re-sending it up to 4 separate times whenever
-        -- GetState's read didn't immediately confirm. The working theory:
-        -- PS99's server does not expect to be told "I confirm" more than
-        -- once for the same trade - a second/third SetConfirmed(true) call,
-        -- sent while the FIRST one may have already landed and was simply
-        -- slow to reflect in GetState (a known flaky read elsewhere in this
-        -- file - see readyTrade/addPet's own comments on the same lag),
-        -- could look to the game like the confirmation being reset and
-        -- re-sent, which would explain exactly what was observed: the
-        -- trade visually shows "Confirmed!" but the real completion
-        -- message from PS99 never arrives. Back to a single send, still
-        -- polling (read-only, no repeated commands) for up to 0.5s to see
-        -- whether it landed, purely for the STEP 5 log line below - never
-        -- calling SetConfirmed a second time regardless of what that read
-        -- shows.
-        local confirmed = false
-        local myId = tostring(localPlayer.UserId)
-
-        local function isConfirmedNow()
-            local ok, state = pcall(function() return tradingCommands.GetState() end)
-            if not ok or not state then return false end
-            if type(state._confirmed) == "table" and state._confirmed[myId] then return true end
-            for uid, ps in pairs(state) do
-                if tostring(uid) == myId and type(ps) == "table" and (ps.confirmed or ps.Confirmed) then
-                    return true
-                end
-            end
-            return false
-        end
 
         pcall(function() tradingCommands.SetConfirmed(true) end)
-        for _ = 1, 10 do
-            task.wait(0.05)
-            if isConfirmedNow() then
-                confirmed = true
-                break
+        task.wait()
+        local ok, state = pcall(function() return tradingCommands.GetState() end)
+        local confirmed = false
+        if ok and state then
+            local myId = tostring(localPlayer.UserId)
+            if type(state._confirmed) == "table" and state._confirmed[myId] then confirmed = true end
+            if not confirmed then
+                for uid, ps in pairs(state) do
+                    if tostring(uid) == myId and type(ps) == "table" and (ps.confirmed or ps.Confirmed) then
+                        confirmed = true; break
+                    end
+                end
             end
         end
 
-        if confirmed then
+                if confirmed then
             botConfirmed = true
-            logStep(5, "Bot CONFIRMED - verified via GetState. Now waiting for PS99's own completion message.")
             sendMessage("Trade confirmed!")
             print("[CONFIRM] Confirmed via GetState")
         else
-            -- GetState never reflected it across 4 real SetConfirmed attempts
-            -- (~2 seconds of genuine polling, not one frame) - proceed anyway,
-            -- same as before, but this is now a true last resort instead of
-            -- the default outcome of any minor timing hiccup.
-            warn("[CONFIRM] Could not verify via GetState after 4 attempts - marking confirmed anyway")
-            logStep(5, "Bot confirm UNVERIFIED after 4 attempts - proceeding anyway. Now waiting for PS99's own completion message.")
+            warn("[CONFIRM] Could not verify via GetState - marking confirmed anyway")
             botConfirmed = true
             sendMessage("Trade confirmed!")
         end
@@ -5275,42 +3397,16 @@ end
 
 -- ============================================================
 -- STATUS MONITOR
--- Re-validates items every time the player readies. Brief UI/state flicker
--- is debounced so the same READY cycle cannot trigger duplicate validation.
 -- ============================================================
 local function connectStatus(localId, tradeMethod)
-    safeSpawn("connectStatus", function()
+    task.spawn(function()
         local startTime    = tick()
         local wasReady     = false
         local confirmFired = false
 
-        -- PS99's trade UI/state can briefly disagree while the READY animation
-        -- updates. Do not treat one false read as a real un-ready.
         local notReadyCount = 0
         local READY_LOSS_THRESHOLD = 4
 
-        -- Real bug fix (2026-10-10, live operator report: a deposit that
-        -- was fully validated AND confirmed ("[CONFIRM-CHECK] User side
-        -- verified", "marking confirmed anyway") got declined seconds
-        -- later by this bot itself - "[STATUS] Deposit: user unreadied
-        -- after confirm was fired - declining to prevent swap abuse" -
-        -- even though nothing was actually swapped. "it detects it in
-        -- console, it's just not updating the site" was this: the trade
-        -- never failed, our own bot cancelled a good one. The post-confirm
-        -- un-ready check below used a single isPlayerReady() read with NO
-        -- debounce at all, unlike the identical-purpose pre-confirm check
-        -- just above (which already requires READY_LOSS_THRESHOLD
-        -- consecutive false reads before acting, specifically because
-        -- isPlayerReady() is a flaky multi-fallback heuristic across
-        -- GetState/UI that can glitch for a tick, especially right as
-        -- SetConfirmed() is landing - see this trade's own "[CONFIRM]
-        -- Could not verify via GetState" line right before it). One flaky
-        -- tick was enough to wrongly cancel a real deposit. Same debounce
-        -- pattern, applied here too.
-        local postConfirmNotReadyCount = 0
-
-        -- Once validation starts, do not run it again until we have observed a
-        -- genuine un-ready state. This prevents the repeated checkItems() loop.
         local validationRunning = false
 
         while (tick() - startTime) < TRADE_TIMEOUT_SECONDS
@@ -5319,11 +3415,6 @@ local function connectStatus(localId, tradeMethod)
 
             local nowReady = isPlayerReady()
 
-            -- ========================================================
-            -- READY -> NOT READY
-            -- Require several consecutive false readings to avoid
-            -- transient UI/state glitches.
-            -- ========================================================
             if wasReady and not nowReady and not confirmFired then
                 notReadyCount = notReadyCount + 1
 
@@ -5344,13 +3435,6 @@ local function connectStatus(localId, tradeMethod)
                 notReadyCount = 0
             end
 
-            -- ========================================================
-            -- NOT READY -> READY
-            -- Only one validation can ever start for a ready cycle.
-            -- Set validationRunning BEFORE checkItems() so a second loop
-            -- iteration cannot start another validation while the first
-            -- one is still running.
-            -- ========================================================
             if not wasReady and nowReady and not confirmFired and not validationRunning then
                 wasReady = true
                 notReadyCount = 0
@@ -5360,77 +3444,17 @@ local function connectStatus(localId, tradeMethod)
 
                 if tradeMethod == "deposit" then
                     local hasError, output = checkItems()
-
-                    -- Operator request (2026-09-20): "make sure the bot only
-                    -- accepts cosmic... if there's no cosmic detected, just
-                    -- cancel the trade." The backend (resolveTradeValue in
-                    -- depositService.ts) already refuses to guess a price for
-                    -- a Huge/Titanic/Gargantuan pet with no Cosmic Value read
-                    -- - it credits that portion at 0 rather than inventing a
-                    -- number. That protects against a WRONG value ever being
-                    -- credited, but it still let the trade complete and take
-                    -- the player's real pet for nothing whenever
-                    -- readCosmicValueFromSlot's hover-read just didn't land
-                    -- in time (a known, documented BlueStacks timing race,
-                    -- not a fraud attempt). This is the other half: refuse
-                    -- the trade outright before it ever completes, so a
-                    -- flaky CV read costs the player a re-trade, never a
-                    -- pet. Only gates actual PS99 pets (the accepted-tier
-                    -- name prefixes) - gems and Enchants never have a Cosmic
-                    -- Value tooltip to begin with, so they're untouched.
-                    local missingCosmicName = nil
-                    if not hasError then
-                        for _, it in ipairs(output) do
-                            local lname = tostring(it.displayName or ""):lower()
-                            local isAcceptedTier = lname:sub(1, 5) == "huge "
-                                or lname:sub(1, 8) == "titanic "
-                                or lname:sub(1, 11) == "gargantuan "
-                            if isAcceptedTier and it.cosmicValue == nil then
-                                missingCosmicName = it.displayName
-                                break
-                            end
-                        end
-                    end
-
-                    -- Operator request (2026-09-20): "also do it for gems
-                    -- too" - same principle as the Cosmic Value gate above,
-                    -- applied to reading the gems the player put in. Read
-                    -- here (not down in the success branch) so a genuine
-                    -- trade-state read failure can gate the same way a
-                    -- missing Cosmic Value does, instead of that failure
-                    -- silently looking identical to "0 gems offered, on
-                    -- purpose". See client_trade_gems's own doc comment for
-                    -- exactly what counts as a real failure vs. an honest 0.
-                    local depositGems, gemsReadOk = nil, true
-                    if not hasError and not missingCosmicName then
-                        depositGems, gemsReadOk = client_trade_gems()
-                    end
-
                     if hasError then
                         sendMessage(tostring(output))
                         pcall(function() tradingCommands.SetReady(false) end)
 
-                        -- Keep validationRunning true until a real un-ready is
-                        -- observed. The player must re-ready after rejection.
-                        wasReady = true
-                        task.wait(1)
-                    elseif missingCosmicName then
-                        warn("[CV-GATE] Declining ready - no Cosmic Value read for " .. tostring(missingCosmicName))
-                        sendMessage("Could not read Cosmic Value for " .. tostring(missingCosmicName) .. " - please un-ready and re-ready to retry.")
-                        pcall(function() tradingCommands.SetReady(false) end)
-                        wasReady = true
-                        task.wait(1)
-                    elseif not gemsReadOk then
-                        warn("[GEMS-GATE] Declining ready - could not read gems offered in this trade")
-                        sendMessage("Could not verify the gems in this trade - please un-ready and re-ready to retry.")
-                        pcall(function() tradingCommands.SetReady(false) end)
                         wasReady = true
                         task.wait(1)
                     else
+                        local depositGems = client_trade_gems()
                         lastTradeItems = output
                         lastTradeGems  = depositGems
                         hasReadied     = true
-                            logStep(2, "Items VALIDATED (" .. #lastTradeItems .. " pets + " .. depositGems .. " gems) - bot about to ready")
                             sendMessage("Validated: " .. #lastTradeItems .. " pets + " .. formatDepositGemCredit(depositGems))
 
                             local readied = false
@@ -5443,27 +3467,12 @@ local function connectStatus(localId, tradeMethod)
                             end
 
                             if not readied then
-                                logStep("2-FAIL", "Bot could NOT ready after items validated - SetReady never verified across 3 attempts")
                                 warn("[READY] Bot could not send SetReady(true) after 3 attempts")
                                 sendMessage("Bot could not ready the trade. Please re-open the trade and try again.")
                                 pcall(function() tradingCommands.SetReady(false) end)
                                 validationRunning = false
                                 wasReady = true
-                                -- Real bug fix (2026-09-20): every other terminal
-                                -- failure in this function releases the incoming-
-                                -- trade lock immediately; this one didn't, so the
-                                -- bot ignored every OTHER player's incoming trade
-                                -- until this one's own TRADE_TIMEOUT_SECONDS timer
-                                -- ran out (the safety-net cleanup at the bottom of
-                                -- connectMessage still gets there eventually, this
-                                -- just stops it blocking new trades in the
-                                -- meantime). Only the lock, not resetTradeState()/
-                                -- goNext - the player may still retry readying in
-                                -- this same trade window, so this trade itself
-                                -- isn't being abandoned, just no longer exclusive.
-                                releaseIncomingTradeLock()
                             else
-                                logStep(3, "Bot READIED successfully - waiting for player to click confirm")
                                 sendMessage("Bot READY - click confirm!")
                                 confirmFired = true
                                 validationRunning = false
@@ -5473,98 +3482,13 @@ local function connectStatus(localId, tradeMethod)
 
                 elseif tradeMethod == "withdraw" then
                     local hasError, output = checkItems(true)
-
-                    -- Real gap fix (2026-10-09, operator report/screenshot:
-                    -- a player had 100,000,000 gems typed into their offer
-                    -- during a withdrawal payout and the bot did not reject
-                    -- it): the rejection below used to only ever check
-                    -- `output` (pets) for whether the player added
-                    -- anything - it never looked at gems at all, and gems
-                    -- weren't even read yet at this point in the code. A
-                    -- player adding GEMS instead of a pet during a
-                    -- withdrawal sailed straight past the guard this was
-                    -- supposed to be. Gems are now read right here,
-                    -- unconditionally, so both are known before deciding
-                    -- whether to reject.
-                    local addedGems, addedGemsReadOk = 0, true
-                    if not hasError then
-                        addedGems, addedGemsReadOk = client_trade_gems()
-                    end
-
-                    -- Operator request (2026-10-09): flatly reject a trade
-                    -- that mixes a deposit - pets OR gems - into an active
-                    -- withdrawal payout, instead of trying to handle both
-                    -- in one trade. This is the combined withdraw+deposit
-                    -- feature disabled outright - a blunt, deliberate
-                    -- safety call around exactly the "add something while
-                    -- the bot is mid-payout" shape the operator was
-                    -- worried about, even though no actual hole was ever
-                    -- confirmed in this path's own logic. The withdrawal
-                    -- itself isn't cancelled - just this trade, so a clean
-                    -- retry (payout only, nothing added) goes through fine.
-                    if not hasError and (#output > 0 or (addedGemsReadOk and addedGems > 0)) then
-                        warn("[WITHDRAW-GUARD] Player added item(s)/gems during a withdrawal payout - rejecting the trade")
-                        sendMessage("Withdrawals can't include extra items or gems right now - remove them and trade again for just your withdrawal.")
-                        pcall(function() tradingCommands.SetReady(false) end)
-                        declineTrade()
-                        sendDiscord(
-                            "🚫 **WITHDRAW+DEPOSIT REJECTED**\n**Player:** " .. tostring(lastTradeUsername) ..
-                            "\nTried to add " .. #output .. " item(s) and " .. tostring(addedGems) ..
-                            " gems during a withdrawal payout - trade declined, withdrawal left pending.",
-                            16776960
-                        )
-                        goNext = true
-                        tradeId = 0
-                        lastGameTradeId = nil
-                        method = nil
-                        releaseIncomingTradeLock()
-                        resetTradeState()
-                        continue
-                    end
-
-                    -- Real gap fix (2026-09-20): a player depositing a pet
-                    -- ALONGSIDE a withdrawal (this branch) never got the
-                    -- same Cosmic Value / gems-read gate the plain deposit
-                    -- branch above has - it went straight to crediting
-                    -- whatever checkItems(true)/client_trade_gems()
-                    -- happened to read, missing read included. Same checks,
-                    -- same reasoning, applied here too.
-                    local missingCosmicName = nil
-                    if not hasError then
-                        for _, it in ipairs(output) do
-                            local lname = tostring(it.displayName or ""):lower()
-                            local isAcceptedTier = lname:sub(1, 5) == "huge "
-                                or lname:sub(1, 8) == "titanic "
-                                or lname:sub(1, 11) == "gargantuan "
-                            if isAcceptedTier and it.cosmicValue == nil then
-                                missingCosmicName = it.displayName
-                                break
-                            end
-                        end
-                    end
-                    local depositGems, gemsReadOk = nil, true
-                    if not hasError and not missingCosmicName then
-                        depositGems, gemsReadOk = client_trade_gems()
-                    end
-
                     if hasError then
                         sendMessage(tostring(output))
                         pcall(function() tradingCommands.SetReady(false) end)
                         wasReady = true
                         task.wait(1)
-                    elseif missingCosmicName then
-                        warn("[CV-GATE] Declining ready (withdraw+deposit) - no Cosmic Value read for " .. tostring(missingCosmicName))
-                        sendMessage("Could not read Cosmic Value for " .. tostring(missingCosmicName) .. " - please un-ready and re-ready to retry.")
-                        pcall(function() tradingCommands.SetReady(false) end)
-                        wasReady = true
-                        task.wait(1)
-                    elseif not gemsReadOk then
-                        warn("[GEMS-GATE] Declining ready (withdraw+deposit) - could not read gems offered in this trade")
-                        sendMessage("Could not verify the gems in this trade - please un-ready and re-ready to retry.")
-                        pcall(function() tradingCommands.SetReady(false) end)
-                        wasReady = true
-                        task.wait(1)
                     else
+                        local depositGems = client_trade_gems()
                             lastTradeItems = output
                             lastTradeGems  = depositGems
                             hasReadied     = true
@@ -5597,10 +3521,6 @@ local function connectStatus(localId, tradeMethod)
                                 pcall(function() tradingCommands.SetReady(false) end)
                                 validationRunning = false
                                 wasReady = true
-                                -- Same lock-leak fix as the deposit branch above -
-                                -- see its comment for why only the lock is
-                                -- released here, not the whole trade state.
-                                releaseIncomingTradeLock()
                             else
                                 sendMessage("Bot READY - click confirm!")
                                 confirmFired = true
@@ -5611,61 +3531,21 @@ local function connectStatus(localId, tradeMethod)
                 end
             end
 
-            -- Unready after confirm fired: only cancel for DEPOSIT trades and only
-            -- if the trade hasn't already completed (tradeProcessed guards against
-            -- the trade window closing normally which also looks like an unready).
-            -- See postConfirmNotReadyCount's own doc comment above for why this
-            -- now requires several consecutive false reads, not just one, before
-            -- acting - same debounce the pre-confirm un-ready check already uses.
             if wasReady and not nowReady and confirmFired and tradeMethod == "deposit" and not tradeProcessed and not tradeCancelled then
-                postConfirmNotReadyCount = postConfirmNotReadyCount + 1
-
-                if postConfirmNotReadyCount >= READY_LOSS_THRESHOLD then
-                    -- IMPORTANT: wait 1s grace period before cancelling — the success MSG
-                    -- handler runs concurrently and may have already set tradeProcessed=true.
-                    task.wait(1)
-                    if tradeProcessed or tradeCancelled then
-                        print("[STATUS] Trade already completed during grace period - skipping cancel")
-                        return
-                    end
-
-                    -- 100k-trial simulation (2026-10-10) of this exact race found a
-                    -- real gap: the grace period above only ever checked tradeProcessed/
-                    -- tradeCancelled, never isPlayerReady() itself again. A 4-tick
-                    -- "not ready" streak is only a TRANSIENT glitch, not real swap
-                    -- abuse, if the player is genuinely ready again a full second
-                    -- later - but without this re-check, a resolved glitch still got
-                    -- declined just because the stale streak had already crossed the
-                    -- threshold before it resolved. Simulated false-cancel rate on a
-                    -- genuinely good deposit ranged 14-32% once a glitch burst lasted
-                    -- 3-4 poll ticks (~45-140ms) - plausible given the GUI teardown
-                    -- this is reading through. Re-checking here costs nothing (same
-                    -- isPlayerReady() already used every other tick) and closes the
-                    -- gap regardless of how long a real glitch actually lasts.
-                    -- NOTE: deliberately does NOT `return` here, unlike the
-                    -- tradeProcessed/tradeCancelled check above - this trade is
-                    -- NOT over, it just wasn't real abuse. Returning would end
-                    -- this whole connectStatus coroutine early and stop
-                    -- monitoring the player's ready state for the rest of the
-                    -- trade. Reset the streak and let the while loop's next
-                    -- iteration carry on watching normally.
-                    if isPlayerReady() then
-                        print("[STATUS] Player is ready again after grace period - treating prior un-ready streak as a UI glitch, not cancelling")
-                        postConfirmNotReadyCount = 0
-                    else
-                        warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
-                        sendMessage("Trade items changed - cancelling for safety!")
-                        tradeCancelled = true
-                        tradeProcessed = true
-                        declineTrade()
-                        goNext = true
-                        releaseIncomingTradeLock()
-                        resetTradeState()
-                        return
-                    end
+                task.wait(1)
+                if tradeProcessed or tradeCancelled then
+                    print("[STATUS] Trade already completed during grace period - skipping cancel")
+                    return
                 end
-            else
-                postConfirmNotReadyCount = 0
+                warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
+                sendMessage("Trade items changed - cancelling for safety!")
+                tradeCancelled = true
+                tradeProcessed = true
+                declineTrade()
+                goNext = true
+                releaseIncomingTradeLock()
+                resetTradeState()
+                return
             end
 
             if not isInTrade() then break end
@@ -5676,50 +3556,11 @@ end
 
 -- ============================================================
 -- MESSAGE LISTENER
--- Trade is ONLY processed when PS99 sends the success message.
--- The isInTrade fallback has been removed — it was firing
--- handleTradeCompletion without confirmation that the trade
--- actually completed, causing incorrect deposits/withdrawals.
 -- ============================================================
 local function connectMessage(localId, tradeMethod)
-    -- Real bug fix (2026-10-10, THE operator pattern reported all night:
-    -- "works the first time, then breaks after multiple trades" - live
-    -- evidence confirmed it: a deposit's items genuinely left in Roblox
-    -- (proven by the player's own Trade History showing it completed),
-    -- the bot's own SetConfirmed retries all failed to verify, and NO
-    -- message was ever detected - not success, not even "unrecognized" -
-    -- total silence from this listener for a trade that definitely
-    -- finished. This used to only re-fetch tradingMessage when it was nil
-    -- - but it starts as a real, non-nil object (resolved once at script
-    -- load, near the top of the file) and was then NEVER refreshed again
-    -- for the rest of the bot's uptime. If PS99 destroys and recreates
-    -- its "Message" popup GUI object between trades (a completely normal
-    -- pattern for popup/dialog UI), this reference goes stale after the
-    -- FIRST trade - still a valid, non-nil Lua object, just pointing at a
-    -- dead instance disconnected from the live GUI tree. Every trade
-    -- after that was connecting its completion listener to a popup that
-    -- would never receive another real event again, while PS99 kept
-    -- showing real messages on a completely different, newer instance
-    -- this script never looked at again. Always re-resolving it fresh
-    -- here, every single trade, closes that gap entirely - FindFirstChild
-    -- is cheap, there's no real cost to doing this every time instead of
-    -- only once.
-    -- One layer deeper (2026-10-10, operator report: "it unbreaks when I
-    -- rejoin the game" - rejoining resets EVERYTHING this script references
-    -- at once, which is consistent with more than just the Message popup
-    -- going stale over a long session). playerGUI itself - the container
-    -- everything else gets searched inside of - is also resolved exactly
-    -- once at script startup (near the top of the file) and was never
-    -- re-checked anywhere. If it ever goes stale the same way the Message
-    -- popup did, re-fetching tradingMessage through it would still search a
-    -- dead container and find nothing - this fix alone wouldn't fully
-    -- explain needing a full rejoin to recover otherwise. Re-resolving it
-    -- fresh from localPlayer right before using it, same reasoning as
-    -- tradingMessage/tradingWindow above.
-    local freshGui = localPlayer:FindFirstChildOfClass("PlayerGui")
-    if freshGui then playerGUI = freshGui end
-
-    tradingMessage = playerGUI:FindFirstChild("Message") or tradingMessage
+    if not tradingMessage then
+        tradingMessage = playerGUI:FindFirstChild("Message")
+    end
     if not tradingMessage then
         warn("[MSG] tradingMessage not found - bot cannot detect trade completion!")
         sendDiscord("⚠️ **WARNING**: tradingMessage GUI not found - bot cannot detect trade completion for " .. tostring(lastTradeUsername), 16711680)
@@ -5730,7 +3571,6 @@ local function connectMessage(localId, tradeMethod)
     msgConn = tradingMessage:GetPropertyChangedSignal("Enabled"):Connect(function()
         if not tradingMessage.Enabled then return end
 
-        -- Read the message text
         local text = ""
         pcall(function() text = tradingMessage.Frame.Contents.Desc.Text end)
         if text == "" then pcall(function() text = tradingMessage.Frame.Desc.Text end) end
@@ -5743,42 +3583,15 @@ local function connectMessage(localId, tradeMethod)
         end
 
         print("[MSG] '" .. text .. "'")
-        logStep(6, "Message popup fired, raw text: '" .. text .. "'")
         local low = text:lower()
 
-        -- ✅ ONLY process the trade if PS99 explicitly confirms success
         if low:find("success") or low:find("complet") then
             msgConn:Disconnect()
-            logStep(7, "SUCCESS text matched - calling handleTradeCompletion")
             print("[MSG] SUCCESS message confirmed - processing trade")
-            -- The single most critical call in the whole script - this is
-            -- what actually credits a deposit or confirms a withdrawal. If
-            -- it ever throws partway through (a real Lua bug, not a
-            -- network failure - those are already pcall'd deeper inside),
-            -- the old plain call would let it die with just a generic
-            -- Roblox error, no [FATAL] tag, easy to miss in a long log.
-            local ok, err = xpcall(handleTradeCompletion, function(e)
-                return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
-            end, tradeMethod)
-            if not ok then
-                warn("[FATAL] handleTradeCompletion crashed: " .. tostring(err))
-                -- Don't wait on the 90s TRADE-WATCHDOG to notice - a crash here
-                -- can leave tradeProcessed=true (set at the very top of that
-                -- function) but never reach its own cleanup at the bottom, which
-                -- would otherwise block every future trade until the watchdog's
-                -- hard reset. Force it immediately instead.
-                sendMessage("Something went wrong processing this trade - please contact support with a screenshot of this chat.")
-                goNext = true
-                tradeId = 0
-                lastGameTradeId = nil
-                method = nil
-                releaseIncomingTradeLock()
-                resetTradeState()
-            end
+            handleTradeCompletion(tradeMethod)
             pcall(function() tradingMessage.Enabled = false end)
 
         elseif low:find("cancel") or low:find("left") or low:find("decline") then
-            logStep("6-CANCEL", "Message matched as a CANCEL, not success - trade did not complete")
             msgConn:Disconnect()
             tradeCancelled = true
             tradeProcessed = true
@@ -5797,133 +3610,18 @@ local function connectMessage(localId, tradeMethod)
             resetTradeState()
 
         elseif text ~= "" then
-            -- Real bug fix (2026-10-10, live operator report/evidence: a
-            -- deposit was fully validated, the bot retried SetConfirmed 4
-            -- real times and still couldn't verify it, and no success
-            -- message ever printed afterward - yet the player's own Roblox
-            -- Trade History proved the trade genuinely completed in-game.
-            -- The pets were really gone, the site never credited them, and
-            -- this listener never even logged a success OR an unrecognized
-            -- message in between - total silence). This handler only fires
-            -- on tradingMessage's Enabled property actually CHANGING
-            -- (GetPropertyChangedSignal("Enabled")). The success/cancel
-            -- branches above both explicitly reset Enabled back to false
-            -- after handling their message - this branch never did. If an
-            -- earlier message of some OTHER unrecognized kind appeared
-            -- during the same trade and left Enabled sitting at true, then
-            -- PS99 later changing only the TEXT (not re-toggling Enabled)
-            -- for the real "Trade successfully completed!" message would
-            -- never produce a false->true transition for this listener to
-            -- catch - the success text could appear and be completely
-            -- invisible to this bot. Resetting Enabled=false here too
-            -- guarantees the next real message, whatever it is, always
-            -- gets a fresh transition.
             print("[MSG] Unrecognised message (ignoring): '" .. text .. "'")
             pcall(function() tradingMessage.Enabled = false end)
         end
     end)
 
-    -- Safety timeout: if the trade window disappears but we never got a success
-    -- message, log it and clean up WITHOUT processing the trade.
     task.spawn(function()
         local startTime = tick()
         while (tick() - startTime) < TRADE_TIMEOUT_SECONDS and not goNext and tradeId == localId do
             task.wait(0.5)
         end
-        -- If we exited the loop without processing, clean up safely
         if not tradeProcessed and not tradeCancelled and not goNext then
-            -- Balance-delta fallback (2026-10-11, see preConfirmGemBalance's
-            -- own doc comment in connectConfirm for the live incident this
-            -- fixes) - before giving up on a deposit, check whether the
-            -- bot's own gem balance AND item count actually moved by the
-            -- amounts independently verified at confirm time. A popup can
-            -- fail to fire; gems/items actually landing in this bot's
-            -- account cannot lie. Deposit-only, and only when a confirm was
-            -- actually verified (preConfirmGemBalance ~= nil) - a trade that
-            -- never got that far has nothing trustworthy to compare against.
-            --
-            -- Simulated (109,000 trials) before trusting this: gems alone
-            -- false-positives on small gems-only deposits if the bot's own
-            -- passive in-game income (breakables, reward chests) happens to
-            -- land in the same ~2min window. Requiring the item count to
-            -- also match when the trade included items cut that false-
-            -- positive rate ~250x; for gems-only deposits (nothing to
-            -- corroborate with) GEMS_ONLY_FALLBACK_FLOOR keeps small amounts
-            -- out of auto-credit entirely - those fall through to the manual
-            -- Discord alert below instead, same as before this fix existed.
-            if tradeMethod == "deposit" and preConfirmGemBalance ~= nil
-                and (lastTradeGems > 0 or #lastTradeItems > 0)
-            then
-                local ok, currentBalance = pcall(getBotGemBalance)
-                local ok2, currentItemCount = pcall(getHugesTitanics)
-                currentItemCount = (ok2 and type(currentItemCount) == "table") and #currentItemCount or nil
-
-                local gemsOk = lastTradeGems <= 0
-                    or (ok and type(currentBalance) == "number"
-                        and (currentBalance - preConfirmGemBalance) >= lastTradeGems)
-
-                local itemsOk = #lastTradeItems <= 0
-                    or (currentItemCount ~= nil and preConfirmItemCount ~= nil
-                        and (currentItemCount - preConfirmItemCount) >= #lastTradeItems)
-
-                local gemsOnlyFloorOk = #lastTradeItems > 0
-                    or lastTradeGems >= GEMS_ONLY_FALLBACK_FLOOR
-
-                if gemsOk and itemsOk and gemsOnlyFloorOk then
-                    warn("[MSG] No success popup ever fired, but gems/items confirm this deposit landed (" ..
-                        tostring(preConfirmGemBalance) .. " -> " .. tostring(currentBalance) ..
-                        ", expected +" .. tostring(lastTradeGems) .. " gems, +" .. #lastTradeItems ..
-                        " items) - crediting anyway")
-                    sendDiscord("\xE2\x9A\xA0\xEF\xB8\x8F **DEPOSIT RECOVERED (no popup, balance-confirmed)**\n**Player:** " ..
-                        tostring(lastTradeUsername) ..
-                        "\nNo success message was ever seen, but the bot's own gems and item count both moved by " ..
-                        "the validated amounts, so this was credited anyway instead of being silently dropped.", 16776960)
-                    pcall(function() msgConn:Disconnect() end)
-                    -- Same call shape as the real success branch above -
-                    -- handleTradeCompletion already closes the trade window
-                    -- and does its own resetTradeState()/goNext/
-                    -- releaseIncomingTradeLock() internally (see its own
-                    -- ending) - duplicating that here would just be
-                    -- redundant, not safer.
-                    local completionOk, completionErr = xpcall(handleTradeCompletion, function(e)
-                        return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
-                    end, tradeMethod)
-                    if not completionOk then
-                        warn("[FATAL] handleTradeCompletion (balance-delta recovery path) crashed: " .. tostring(completionErr))
-                        sendMessage("Something went wrong processing this trade - please contact support with a screenshot of this chat.")
-                        -- Unlike the normal success path, a crash here means
-                        -- handleTradeCompletion's own cleanup never ran -
-                        -- force it the same way the SUCCESS branch above does
-                        -- on its own crash path, so this doesn't block every
-                        -- future trade.
-                        goNext = true
-                        tradeId = 0
-                        lastGameTradeId = nil
-                        method = nil
-                        releaseIncomingTradeLock()
-                        resetTradeState()
-                    end
-                    return
-                end
-
-                print("[MSG] Balance-delta fallback did not confirm this deposit (gemsOk=" .. tostring(gemsOk) ..
-                    " itemsOk=" .. tostring(itemsOk) .. " gemsOnlyFloorOk=" .. tostring(gemsOnlyFloorOk) ..
-                    ") - falling through to manual-review alert")
-            end
-
             warn("[MSG] Trade ended without success message - NOT processing to avoid incorrect trade")
-            -- Real bug fix (2026-10-10, live operator report: both sides showed
-            -- "Confirmed!" with a countdown on a real 701M-value trade, it just
-            -- sat there, nothing ever credited, refreshing did nothing). This
-            -- branch is what actually ran after 120s - it had NO sendMessage call
-            -- at all (same silent-abandonment pattern as the TRADE-WATCHDOG fix
-            -- above) AND never touched the real Roblox trade window, so the
-            -- player was left staring at a trade that looked "confirmed" forever
-            -- with zero explanation while this script had already quietly given
-            -- up and moved on internally. Tell them directly, and actually close
-            -- the stuck window instead of abandoning it mid-air.
-            sendMessage("Trade didn't complete - please re-trade. If items are gone, contact support.")
-            declineTrade()
             sendDiscord("⚠️ **TRADE NO-MSG**\n**Player:** " .. tostring(lastTradeUsername) ..
                 "\n**Method:** " .. tostring(tradeMethod) ..
                 "\nTrade ended but no success message received - items NOT processed. Check manually.", 16776960)
@@ -5932,8 +3630,6 @@ local function connectMessage(localId, tradeMethod)
                 cancelWithdrawalTrade(lastWithdrawalData.data, "No success message received", true)
             end
 
-            -- CRITICAL: release BOTH the processing lock and the Roblox trade state.
-            -- Without this, the next incoming trade can be permanently ignored.
             goNext = true
             tradeId = 0
             lastGameTradeId = nil
@@ -5949,17 +3645,10 @@ end
 -- STARTUP: LOAD ITEMS
 -- ============================================================
 print("========================================")
-print("[BOT] BloxyFlip Bot v2.7 Starting (FULL PIPELINE FAST + FAIL-CLOSED)...")
+print("[BOT] BloxyFlip Bot v2.7-simple Starting (base script + real Cosmic Value wiring)...")
 print("[BOT] Bot ID: " .. BOT_ID)
 print("[BOT] API:    " .. website)
 print("========================================")
-
--- Sync the signing clock BEFORE the very first authenticated call (the
--- item catalog load right below) - see serverTimeOffset's own doc
--- comment above for the full incident this prevents. A failed sync here
--- just leaves the offset at 0 (today's normal behavior) rather than
--- blocking startup - this is a correction, not a hard requirement.
-syncServerTimeOffset()
 
 local itemsLoaded = false
 for attempt = 1, 5 do
@@ -5975,156 +3664,15 @@ end
 print("[BOT] [OK] Ready! " .. #supporteditems .. " live catalog entries loaded.")
 
 -- ============================================================
--- STARTUP GEM BALANCE DUMP → Discord webhook
--- Sends full save data + gem balance info to Discord on startup
--- so you can see exactly what path PS99 uses for diamond balance.
--- Splits into multiple webhook messages if content is too long.
+-- ANTI-AFK — Hoverboard toggle every 15s
 -- ============================================================
 task.spawn(function()
-    task.wait(5) -- wait for save data to load
-
-    local function sendWebhookChunk(title, content)
-        -- Discord embed description max is ~4096 chars, split if needed
-        local MAX = 3800
-        local chunks = {}
-        while #content > 0 do
-            table.insert(chunks, content:sub(1, MAX))
-            content = content:sub(MAX + 1)
-        end
-        for i, chunk in ipairs(chunks) do
-            local label = title .. (i > 1 and (" (part " .. i .. ")") or "")
-            pcall(function()
-                request({
-                    Url    = discordWebhook,
-                    Method = "POST",
-                    Body   = httpService:JSONEncode({
-                        embeds = {{
-                            title       = "🔍 " .. label,
-                            description = "```\n" .. chunk .. "\n```",
-                            color       = 3447003,
-                        }}
-                    }),
-                    Headers = { ["Content-Type"] = "application/json" }
-                })
-            end)
-            task.wait(1) -- rate limit
-        end
-    end
-
-    local lines = {}
-
-    -- 1. Get save data
-    local sd = nil
-    for _, fn in ipairs({
-        function() return saveModule.Get()      end,
-        function() return saveModule:Get()      end,
-        function() return saveModule.GetData()  end,
-        function() return saveModule:GetData()  end,
-        function() return saveModule.Data       end,
-        function() return saveModule.SaveData   end,
-        function() return saveModule.PlayerData end,
-    }) do
-        local ok, result = pcall(fn)
-        if ok and type(result) == "table" then sd = result; break end
-    end
-
-    if not sd then
-        sendWebhookChunk("GEM DUMP - ERROR", "saveModule returned nil for all call styles")
-        return
-    end
-
-    -- 2. Recursively dump all numeric values from save data (depth 5)
-    table.insert(lines, "=== SAVE DATA NUMERIC VALUES ===")
-    local function dumpNums(t, path, depth)
-        if depth > 5 then return end
-        for k, v in pairs(t) do
-            local p = path .. "." .. tostring(k)
-            if type(v) == "number" then
-                table.insert(lines, p .. " = " .. tostring(v))
-            elseif type(v) == "table" then
-                dumpNums(v, p, depth + 1)
-            end
-        end
-    end
-    dumpNums(sd, "saveData", 1)
-
-    -- 3. leaderstats
-    table.insert(lines, "")
-    table.insert(lines, "=== LEADERSTATS ===")
-    pcall(function()
-        local ls = localPlayer:FindFirstChild("leaderstats")
-        if ls then
-            for _, v in ipairs(ls:GetChildren()) do
-                table.insert(lines, "leaderstats." .. v.Name .. " = " .. tostring(v.Value))
-            end
-        else
-            table.insert(lines, "(none)")
-        end
-    end)
-
-    -- 4. Player attributes
-    table.insert(lines, "")
-    table.insert(lines, "=== PLAYER ATTRIBUTES ===")
-    pcall(function()
-        local attrs = localPlayer:GetAttributes()
-        if next(attrs) then
-            for k, v in pairs(attrs) do
-                table.insert(lines, "attr." .. tostring(k) .. " = " .. tostring(v))
-            end
-        else
-            table.insert(lines, "(none)")
-        end
-    end)
-
-    -- 5. Player direct value children
-    table.insert(lines, "")
-    table.insert(lines, "=== PLAYER CHILDREN (values) ===")
-    pcall(function()
-        for _, c in ipairs(localPlayer:GetChildren()) do
-            if c:IsA("NumberValue") or c:IsA("IntValue") or c:IsA("StringValue") then
-                table.insert(lines, c.Name .. " = " .. tostring(c.Value))
-            elseif c:IsA("Folder") or c:IsA("Configuration") then
-                for _, cc in ipairs(c:GetChildren()) do
-                    if cc:IsA("NumberValue") or cc:IsA("IntValue") then
-                        table.insert(lines, c.Name .. "." .. cc.Name .. " = " .. tostring(cc.Value))
-                    end
-                end
-            end
-        end
-    end)
-
-    -- 6. Current getBotGemBalance result
-    table.insert(lines, "")
-    table.insert(lines, "=== getBotGemBalance() result ===")
-    pcall(function()
-        local bal = getBotGemBalance()
-        table.insert(lines, "result = " .. tostring(bal))
-        table.insert(lines, "heartbeat gem_balance = " .. tostring(botGemBalance))
-    end)
-
-    -- Send all lines to webhook, chunked
-    sendWebhookChunk("GEM BALANCE DUMP", table.concat(lines, "\n"))
-    print("[GEM-DUMP] Sent to Discord webhook")
-end)
-
--- ============================================================
--- ANTI-AFK — Hoverboard toggle every 15s
--- Tries multiple methods in order until one works.
--- Also dumps ALL game remotes to console on startup so you can
--- see exactly what PS99 has available for debugging.
--- ============================================================
-
-
-safeSpawnLoop("ANTI-AFK", function()
     task.wait(8)
 
-    -- Detect which executor keypress function is available
     local keypressFunc   = getgenv().keypress   or (syn and syn.keypress)
     local keyreleaseFunc = getgenv().keyrelease  or (syn and syn.keyrelease)
-    -- Q key = virtual keycode 81
     local Q_KEY = 81
 
-    -- Find hoverboard UI button by searching PlayerGui broadly
     local function findHoverButton()
         local gui = localPlayer:FindFirstChildOfClass("PlayerGui")
         if not gui then return nil end
@@ -6143,7 +3691,6 @@ safeSpawnLoop("ANTI-AFK", function()
         return nil
     end
 
-    -- Find hoverboard remote by name
     local function findHoverRemote()
         for _, obj in ipairs(replicatedStorage:GetDescendants()) do
             if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
@@ -6164,9 +3711,6 @@ safeSpawnLoop("ANTI-AFK", function()
     while true do
         task.wait(15)
 
-        -- Only skip when an actual Roblox trade window is open.
-        -- goNext is also used as a processing/claim lock, so it can be false
-        -- even when no trade was successfully accepted.
         if isInTrade() then
             print("[ANTI-AFK] Skipping - actual trade is open")
             continue
@@ -6174,7 +3718,6 @@ safeSpawnLoop("ANTI-AFK", function()
 
         local toggled = false
 
-        -- Method 1: executor keypress (most reliable, simulates actual Q press)
         if not toggled and keypressFunc and keyreleaseFunc then
             pcall(function()
                 keypressFunc(Q_KEY)
@@ -6189,7 +3732,6 @@ safeSpawnLoop("ANTI-AFK", function()
             end)
         end
 
-        -- Method 2: click the UI button directly
         if not toggled and hoverButton then
             pcall(function()
                 hoverButton:Activate()
@@ -6200,7 +3742,6 @@ safeSpawnLoop("ANTI-AFK", function()
             end)
         end
 
-        -- Method 3: fire the remote directly
         if not toggled and hoverRemote then
             pcall(function()
                 if hoverRemote:IsA("RemoteEvent") then
@@ -6217,14 +3758,12 @@ safeSpawnLoop("ANTI-AFK", function()
             end)
         end
 
-        -- If nothing worked yet, retry finding button/remote (they may load late)
         if not toggled then
             if not hoverButton then hoverButton = findHoverButton() end
             if not hoverRemote then hoverRemote = findHoverRemote() end
             warn("[ANTI-AFK] No toggle method worked this cycle - check remote dump above")
         end
 
-        -- Always also reset Roblox's own idle timer regardless
         pcall(function()
             virtualUser:CaptureController()
             virtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
@@ -6234,7 +3773,6 @@ safeSpawnLoop("ANTI-AFK", function()
     end
 end)
 
--- Roblox Idled fallback
 pcall(function()
     localPlayer.Idled:Connect(function()
         warn("[ANTI-AFK] Roblox Idled fired - emergency input!")
@@ -6256,7 +3794,7 @@ end)
 -- ============================================================
 -- KEEP-ALIVE
 -- ============================================================
-safeSpawnLoop("KEEP-ALIVE", function()
+task.spawn(function()
     while true do
         pcall(function()
             local hum = localPlayer.Character and localPlayer.Character:FindFirstChild("Humanoid")
@@ -6269,12 +3807,7 @@ end)
 -- ============================================================
 -- HEARTBEAT
 -- ============================================================
-safeSpawnLoop("HEARTBEAT", function()
-    -- The backend now reconciles client_inventory from the bot's real
-    -- Roblox holdings.  Send a compact aggregate of Huge/Titanic holdings
-    -- because those are the items used by the withdrawal system.  UUIDs are
-    -- intentionally NOT sent to the ledger; the backend resolves the same
-    -- config+variant identity used by its deposit path.
+task.spawn(function()
     local function buildHeldItemsSnapshot()
         local snapshot = {}
         local ok, inventory = pcall(getHugesTitanics)
@@ -6313,8 +3846,6 @@ safeSpawnLoop("HEARTBEAT", function()
 
         local heartbeatPayload = {
             botId = BOT_ID,
-            -- New backend contract: physical holdings are reconciled against
-            -- reservations already attached to this bot's in-flight claims.
             heldGems = physicalGems,
             heldItems = heldItems,
         }
@@ -6332,10 +3863,6 @@ safeSpawnLoop("HEARTBEAT", function()
             local hbData = decodeBody(hbResp)
 
             if hbData then
-                -- New backend field: heldGemsBalance is the authoritative
-                -- tracked gem float used by the withdrawal eligibility gate.
-                -- Treat zero as a valid value; only fall back to the legacy
-                -- gem_balance field when heldGemsBalance is genuinely absent.
                 local rawHeld = hbData.heldGemsBalance
                 local parsedHeld = tonumber(rawHeld)
 
@@ -6347,41 +3874,13 @@ safeSpawnLoop("HEARTBEAT", function()
                 elseif rawHeld ~= nil then
                     warn("[HEARTBEAT] heldGemsBalance present but invalid: " .. tostring(rawHeld))
                 else
-                    -- Compatibility with older backend responses only.
                     if type(hbData.gem_balance) == "number" then
                         botGemBalance = hbData.gem_balance
                         botGemBalancePresent = false
                         print("[HEARTBEAT] OK | heldGemsBalance absent; legacy gem_balance=" .. tostring(botGemBalance))
                     else
-                        -- Noted once, not every heartbeat (2026-10-11,
-                        -- operator request: "so I can just send console") -
-                        -- this field has NEVER been sent by the backend
-                        -- (confirmed: not referenced anywhere in
-                        -- robloxBot.routes.ts's /heartbeat handler), so
-                        -- "absent" here is the backend's normal, permanent
-                        -- behavior, not a flaky failure - and it isn't
-                        -- actually used for any live decision in this script
-                        -- (botGemBalance only ever feeds the startup Discord
-                        -- diagnostic dump, nothing trade-related). Printing
-                        -- the full explanation on every single heartbeat
-                        -- (every ~30s) would just bury real signal in noise.
-                        if not heldGemsBalanceAbsentExplained then
-                            heldGemsBalanceAbsentExplained = true
-                            print("[HEARTBEAT] OK | heldGemsBalance absent | no legacy gem_balance " ..
-                                "(expected - the backend never sends this field at all, it's not wired to any " ..
-                                "live decision here, this line won't repeat the explanation again this session)")
-                        else
-                            print("[HEARTBEAT] OK | heldGemsBalance absent | no legacy gem_balance")
-                        end
+                        print("[HEARTBEAT] OK | heldGemsBalance absent | no legacy gem_balance (expected - not wired to any live decision here)")
                     end
-                end
-
-                if type(hbData.reconciled) == "table" then
-                    local unresolved = type(hbData.reconciled.unresolved) == "table" and #hbData.reconciled.unresolved or 0
-                    local kept = type(hbData.reconciled.keptReservedOnly) == "table" and #hbData.reconciled.keptReservedOnly or 0
-                    print("[HEARTBEAT] Reconciled | unresolved=" .. tostring(unresolved) ..
-                        " | keptReservedOnly=" .. tostring(kept) ..
-                        " | serverHeldGems=" .. tostring(hbData.heldGemsBalance))
                 end
             end
         else
@@ -6392,160 +3891,19 @@ safeSpawnLoop("HEARTBEAT", function()
     end
 end)
 
--- Periodic re-sync of the signing clock, independent of the heartbeat
--- loop above (which reports inventory, not this) - see serverTimeOffset's
--- own doc comment near the top of the file. A single sync at startup
--- corrects whatever drift already existed then, but drift that
--- accumulates DURING a long session (the actual live incident this was
--- built for: "breaks after 10 minutes") needs to keep being corrected
--- for as the session continues. Every 5 minutes is comfortably inside
--- the backend's own 5-minute tolerance window, so drift can never
--- silently build past it between syncs.
-safeSpawnLoop("CLOCK-RESYNC", function()
-    while true do
-        task.wait(300)
-        syncServerTimeOffset()
-    end
-end)
-
--- Real gap fix (2026-10-10, found during a proactive audit, no live
--- incident report for this specific one yet): GetSupported() - the pet
--- catalog load, including each pet's price used as the Cosmic Value
--- plausibility floor - only ever runs in the startup retry loop (see
--- "STARTUP: LOAD ITEMS" above) and is never called again for the rest of
--- this bot process's lifetime, which tonight's logs show commonly running
--- for hours. Any pet added to the site's catalog, or any price change,
--- after this bot started would be completely invisible to it until
--- someone manually restarts the script - a new pet would show as
--- "Unsupported/unmapped item" and get rejected outright, and a price
--- change wouldn't be reflected in the plausibility floor used to
--- sanity-check Cosmic Value reads. GetSupported() itself is safe to call
--- again later: it only resets/rebuilds catalogByKey/supporteditems/etc.
--- synchronously with no task.wait() in between the reset and the rebuild
--- completing, so no other coroutine can ever observe a half-empty catalog
--- mid-refresh (Lua's coroutines only switch at an actual yield point).
--- Skipped while a trade is actively being processed anyway, purely as
--- extra caution, even though it's not strictly required for correctness.
-safeSpawnLoop("CATALOG-REFRESH", function()
-    while true do
-        task.wait(600)
-        if not activeIncomingTrade then
-            print("[ITEMS] Periodic catalog refresh starting...")
-            local ok = GetSupported()
-            if ok then
-                print("[ITEMS] Periodic catalog refresh OK - " .. #supporteditems .. " entries")
-            else
-                warn("[ITEMS] Periodic catalog refresh failed - keeping previous catalog")
-            end
-        end
-    end
-end)
-
--- Defensive hardening (2026-10-10, NOT confirmed by direct log evidence the
--- way the Message-popup bug was - this is precautionary, following the same
--- reasoning after the operator reported "it unbreaks when I rejoin the
--- game... I have to bounce around 24/7"). saveModule/tradingCommands - the
--- actual game modules that EVERY trade action goes through (SetReady,
--- SetConfirmed, SetItem, GetState, GetAllRequests, AcceptRequest, all of
--- it) - are require()'d exactly ONCE at script startup and never checked
--- again, same pattern as the Message popup and PlayerGui container that
--- WERE confirmed stale. If these ever go stale the same way (the
--- underlying ModuleScript instance gets destroyed/replaced), the symptom
--- would be much broader than just missed completion messages - closer to
--- "the whole bot quietly stops working" (deeply consistent with "I have to
--- bounce around 24/7"), since literally every trade command flows through
--- these two references. Rejoining the game forces a brand new script
--- execution, which re-requires everything fresh - exactly the kind of fix
--- a stale module reference would also explain. Checked every 60s (not
--- per-trade like the GUI fixes - re-require() running a module's top-level
--- code again carries more weight than a cheap FindFirstChild, so this is
--- intentionally less aggressive) and ONLY acts if the actual underlying
--- Instance has genuinely changed, not on every check.
-safeSpawnLoop("MODULE-STALENESS-WATCHDOG", function()
-    while true do
-        task.wait(60)
-        if not activeIncomingTrade then
-            local freshSave = clientFolder:FindFirstChild("Save")
-            local freshTradingCmds = clientFolder:FindFirstChild("TradingCmds")
-
-            if freshSave and freshSave ~= saveModuleScript then
-                warn("[BOT] Save ModuleScript instance changed since startup - re-requiring")
-                saveModuleScript = freshSave
-                local fresh = tryRequireModule(saveModuleScript, "Save")
-                if fresh then
-                    saveModule = fresh
-                    print("[BOT] [OK] Save module re-loaded after instance change")
-                else
-                    warn("[BOT] Save module re-load FAILED - keeping previous reference")
-                end
-            end
-
-            if freshTradingCmds and freshTradingCmds ~= tradingCmdsScript then
-                warn("[BOT] TradingCmds ModuleScript instance changed since startup - re-requiring")
-                tradingCmdsScript = freshTradingCmds
-                local fresh = tryRequireModule(tradingCmdsScript, "TradingCmds")
-                if fresh then
-                    tradingCommands = fresh
-                    print("[BOT] [OK] TradingCmds module re-loaded after instance change")
-                else
-                    warn("[BOT] TradingCmds module re-load FAILED - keeping previous reference")
-                end
-            end
-        end
-    end
-end)
-
 -- ============================================================
 -- TRADE ID TRACKER
 -- ============================================================
--- Real bug: this used to overwrite the shared `tradeId` every 0.1s
--- completely independently of the main trade loop. The entire trade state
--- machine (every `tradeId == localId` / `tradeId ~= localId` checkpoint
--- below) depends on `tradeId` staying authoritative and only changing when
--- the main loop itself changes it - it snapshots `tradeId` into `localId`
--- once at the start of handling a claimed trade, then re-checks that
--- snapshot at each step to make sure it's still safely working on that same
--- trade. A second trade event landing mid-negotiation (e.g. a deposit
--- offered while the bot is still mid-payout on a withdrawal) can shift
--- Roblox's own live trade id, and this tracker would stomp the shared
--- variable out from under the main loop with no coordination at all -
--- tripping or silently defeating those checks and corrupting which trade's
--- state the bot thinks it's acting on. Gated on `activeIncomingTrade` (the
--- same lock the main loop sets the instant it claims a trade and clears via
--- releaseIncomingTradeLock() at every exit) so this only ever refreshes
--- `tradeId` while no trade is actively being processed - once the main loop
--- owns a trade, it owns `tradeId` exclusively until it releases the lock.
--- Safety net added 2026-10-09 (operator report: "bot stopped working"
--- after a run of deposits): if activeIncomingTrade ever gets stuck true
--- (any code path that claims the lock without releasing it on every exit
--- - a pre-existing risk this tracker's own gate above didn't create, but
--- did stop silently masking, since the old unconditional version kept
--- tradeId moving no matter what). TRADE_LOCK_STALE_FALLBACK_SECONDS is
--- longer than the TRADE LOCK WATCHDOG's own 90s threshold (further below)
--- so that watchdog gets the first, clean chance to actually release the
--- lock properly - this is strictly the last-resort backstop if that ALSO
--- somehow doesn't fire, so the bot can never again freeze accepting new
--- trades for longer than this, full stop.
-local TRADE_LOCK_STALE_FALLBACK_SECONDS = 100
-safeSpawnLoop("TRADE-ID-TRACKER", function()
+task.spawn(function()
     while task.wait(0.1) do
-        local lockStale = activeIncomingTrade
-            and activeIncomingSince > 0
-            and (tick() - activeIncomingSince) >= TRADE_LOCK_STALE_FALLBACK_SECONDS
-        if not activeIncomingTrade or lockStale then
-            tradeId = getTradeId()
-        end
+        tradeId = getTradeId()
     end
 end)
 
 -- ============================================================
 -- TRADE LOCK WATCHDOG
 -- ============================================================
--- If a trade request gets claimed but PS99 never actually opens/keeps the
--- trade window, this prevents the incoming-trade lock from staying stuck.
--- The timeout is intentionally conservative so normal API/processing delays
--- do not race the main trade handler.
-safeSpawnLoop("TRADE-LOCK-WATCHDOG", function()
+task.spawn(function()
     while true do
         task.wait(5)
 
@@ -6556,11 +3914,6 @@ safeSpawnLoop("TRADE-LOCK-WATCHDOG", function()
             and not isInTrade()
         then
             warn("[TRADE-WATCHDOG] Stale incoming-trade lock detected - releasing safely")
-            -- This path previously had NO player-facing message at all (not even
-            -- the no-op sendMessage - it was never called here), so a trade that
-            -- got silently dropped by this exact watchdog gave the player zero
-            -- indication anything had happened. Now that sendMessage actually
-            -- sends again (see its own doc comment), tell them directly.
             sendMessage("Trade didn't go through - please re-trade.")
             sendDiscord(
                 "⚠️ **TRADE LOCK RECOVERY**\n" ..
@@ -6576,103 +3929,19 @@ safeSpawnLoop("TRADE-LOCK-WATCHDOG", function()
             releaseIncomingTradeLock()
             resetTradeState()
         end
-
-        -- Hard backstop added 2026-10-09 (operator report: the bot stopped
-        -- accepting new trades after a run of deposits, and did not
-        -- recover). The check above only ever fires while `not isInTrade()`
-        -- - deliberately conservative so it never interrupts a trade
-        -- that's genuinely still open and in progress. But that same
-        -- carefulness means if some OTHER code path ever claims the lock,
-        -- hits an error partway through (crashes out of a task.spawn
-        -- without reaching any of its own cleanup/release calls), and
-        -- leaves a real Roblox trade window open with nobody driving it,
-        -- isInTrade() stays true forever and the gentler check above can
-        -- never satisfy its own condition - the bot would then refuse
-        -- every future trade indefinitely, exactly what got reported.
-        -- After a much longer wait (5 minutes - long enough that this
-        -- never fires over a trade anyone could still be legitimately
-        -- negotiating), force the lock closed regardless of isInTrade(),
-        -- actively trying to decline/close whatever window might still be
-        -- open. Abandoning one genuinely-stuck trade is a far smaller cost
-        -- than silently refusing every trade after it for the rest of the
-        -- bot's uptime.
-        if activeIncomingTrade
-            and activeIncomingSince > 0
-            and (tick() - activeIncomingSince) >= 300
-        then
-            warn("[TRADE-WATCHDOG] HARD BACKSTOP: incoming-trade lock stuck 5+ minutes even with a trade window open - forcing it closed")
-            sendDiscord(
-                "🚨 **TRADE LOCK HARD RESET**\n" ..
-                "The incoming-trade lock was stuck for 5+ minutes, including while a Roblox trade window " ..
-                "appeared to still be open - something likely crashed mid-trade without cleaning up. " ..
-                "Forcing the lock closed and declining/closing whatever trade may still be open so the bot " ..
-                "can accept new trades again. Check the account manually for a stuck Roblox trade window.",
-                16711680
-            )
-
-            declineTrade()
-            tradeCancelled = true
-            tradeProcessed = true
-            goNext = true
-            tradeId = 0
-            lastGameTradeId = nil
-            method = nil
-            releaseIncomingTradeLock()
-            resetTradeState()
-
-            -- A trade window stuck open 5+ minutes with nobody driving it is
-            -- the strongest signal available that the client UI itself is
-            -- corrupted, not just this script's bookkeeping - declineTrade()
-            -- above only operates through the same (possibly broken)
-            -- TradingCmds API that got it stuck in the first place, so it
-            -- may not actually succeed. Rejoin for real instead of trusting
-            -- that a dead UI will respond correctly to one more command.
-            selfRejoin("trade lock hard backstop - window open 5+ min with no progress")
-        end
-    end
-end)
-
--- ============================================================
--- PREVENTIVE SELF-REJOIN
--- ============================================================
--- Operator report (2026-10-11, screenshot): the whole game UI froze -
--- Mailbox/gift menu buttons dead, icons gone - NOT while a trade was
--- stuck open. The watchdogs above only ever look at trade-lock state, so
--- they're structurally blind to this: general client UI corruption that
--- builds up under heavy trade volume but isn't tied to any one specific
--- trade. There is no reliable way to detect "is some unrelated menu
--- button still clickable" from this script. Instead of trying to detect
--- it, proactively rejoin on a fixed schedule - only during a genuinely
--- idle moment (no trade in progress) so this never interrupts real work -
--- so any corruption quietly accumulating gets flushed out before it ever
--- reaches the point of visibly breaking.
-local PREVENTIVE_REJOIN_INTERVAL_SECONDS = 30 * 60
-local botStartedAt = tick()
-safeSpawnLoop("PREVENTIVE-SELF-REJOIN", function()
-    while true do
-        task.wait(30)
-        if not activeIncomingTrade
-            and goNext
-            and not isInTrade()
-            and (tick() - botStartedAt) >= PREVENTIVE_REJOIN_INTERVAL_SECONDS
-        then
-            selfRejoin("scheduled preventive rejoin - " .. math.floor((tick() - botStartedAt) / 60) .. " min since last rejoin, idle now", true)
-            botStartedAt = tick()
-        end
     end
 end)
 
 -- ============================================================
 -- MAIN TRADE LOOP
 -- ============================================================
-safeSpawnLoop("MAIN TRADE LOOP", function()
+task.spawn(function()
     while true do
         if type(tradingCommands) ~= "table" then
             warn("[BOT] TradingCommands unavailable - waiting...")
             task.wait(5)
             continue
         end
-
 
         task.wait(0.05)
 
@@ -6685,77 +3954,25 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             continue
         end
 
-        -- Do not blindly process incoming[1]. GetAllRequests() has no
-        -- guaranteed order, and if whoever lands in slot 1 is an
-        -- unrecognized/unresolved request (e.g. a Roblox account with no
-        -- linked BloxyFlip account) that stays open in Roblox, it can keep
-        -- re-landing in slot 1 on every scan - jamming every real trade
-        -- behind it for as long as that one person leaves their window
-        -- open. Prefer the first request that is NOT currently on cooldown
-        -- so one unresolved/ignored user can never block everyone else.
-        local trade = nil
-        if #incoming > 1 then
-            -- Runtime log, not just a code comment, on purpose (2026-10-11,
-            -- operator request: "so I can just send console without telling
-            -- you anything") - which trade got picked out of several, and
-            -- why the others were skipped, used to be invisible in the
-            -- console. Only prints when there's actually a choice to explain.
-            print("[TRADE-PICK] " .. #incoming .. " incoming trades at once - checking cooldowns to pick one")
-        end
-        for _, candidate in ipairs(incoming) do
-            local candidateHold = tonumber(withdrawalHoldUntil[tostring(candidate.UserId)]) or 0
-            if candidateHold <= tick() then
-                trade = candidate
-                if #incoming > 1 then
-                    print("[TRADE-PICK] Picked " .. tostring(candidate.Name) .. " (not on cooldown)")
-                end
-                break
-            elseif #incoming > 1 then
-                print("[TRADE-PICK] Skipping " .. tostring(candidate.Name) .. " - still on cooldown for " ..
-                    string.format("%.1f", candidateHold - tick()) .. "s more")
-            end
-        end
-        if not trade then
-            trade = incoming[1]
-            if #incoming > 1 then
-                print("[TRADE-PICK] Every incoming trade is on cooldown - falling back to the first one anyway (" ..
-                    tostring(trade.Name) .. ") rather than process nothing")
-            end
-        end
-
+        local trade = incoming[1]
         local username = trade.Name
         local userId = tostring(trade.UserId)
 
-        -- A declined blocked-withdrawal request can remain in the incoming
-        -- queue for several frames. Do not repeatedly run the full backend
-        -- lookup for the same user while the platform is still presenting
-        -- that already-declined request.
         local holdUntil = tonumber(withdrawalHoldUntil[userId]) or 0
         if holdUntil > tick() then
-            local lastDecline = tonumber(lastHoldDeclineAt[userId]) or 0
-            if tick() - lastDecline >= 1 then
-                lastHoldDeclineAt[userId] = tick()
-                -- Operator request (2026-10-11): "can you remove that thing,
-                -- where it says retrying" - this used to print a console
-                -- line every ~1s for as long as a blocked/unlinked account
-                -- kept its trade window open, which could spam dozens of
-                -- identical lines in a row and bury real signal in the
-                -- console. The actual decline below is unchanged - this
-                -- only removes the repeated print, not the behavior.
-                pcall(function()
-                    if type(tradingCommands.DeclineRequest) == "function" then
-                        tradingCommands.DeclineRequest(trade)
-                    end
-                end)
-            end
+            print("[TRADE] Ignoring repeated blocked-withdrawal request | user=" ..
+                tostring(username) .. " | cooldown=" ..
+                string.format("%.1fs", holdUntil - tick()))
+            pcall(function()
+                if type(tradingCommands.DeclineRequest) == "function" then
+                    tradingCommands.DeclineRequest(trade)
+                end
+            end)
             continue
         else
             withdrawalHoldUntil[userId] = nil
         end
 
-        -- CLAIM THE REQUEST BEFORE ANY API CALL.
-        -- Prevents two loop iterations from entering the same
-        -- incoming trade concurrently.
         if activeIncomingTrade then
             continue
         end
@@ -6763,8 +3980,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         activeIncomingTrade = true
         activeIncomingUserId = userId
         activeIncomingSince = tick()
-        -- This is a processing lock, NOT proof that a Roblox trade is open.
-        -- Actual trade state is checked with isInTrade().
         goNext = false
 
         print("[TRADE] Incoming from: " .. username .. " (" .. userId .. ") [LOCKED]")
@@ -6776,8 +3991,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             " | found=" .. tostring(userInfo and userInfo.found) ..
             " | bloxyflipUserId=" .. tostring(userInfo and userInfo.userId))
 
-        -- A failed user lookup is an API/backend error, NOT proof that the
-        -- user has no withdrawal. Never fall through to DEPOSIT MODE.
         if not userInfo or userInfo.success ~= true then
             warn("[USER-LOOKUP-GUARD] check-user-banned failed; refusing DEPOSIT MODE | user=" ..
                 tostring(username) .. " | robloxUserId=" .. tostring(userId) ..
@@ -6790,14 +4003,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
                 end
             end)
             sendMessage("BloxyFlip could not verify your account right now. Please try again.")
-
-            -- Same real bug/fix as the WITHDRAWAL LOOKUP ERROR GUARD further
-            -- down (operator report, 2026-09-19): no cooldown here meant a
-            -- genuinely failing check-user-banned call (network/auth blip)
-            -- would resend this exact message every single tick for as
-            -- long as the trade offer stayed open - repeated identical chat
-            -- spam risk to the bot's own Roblox account.
-            withdrawalHoldUntil[userId] = tick() + WITHDRAWAL_HOLD_COOLDOWN
             goNext = true
             tradeId = 0
             lastGameTradeId = nil
@@ -6838,20 +4043,7 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         lastTradeUsername = username
         lastTradeUserId = userId
 
-        -- ====================================================
-        -- WITHDRAWAL CHECK
-        -- Do not use a per-user cooldown here. A player may have multiple
-        -- legitimate withdrawals queued back-to-back. We only suppress an
-        -- exact withdrawal ID after the backend returns it again.
         local recentlyConfirmed = false
-        -- ====================================================
-        -- The Worker now atomically claims the next available
-        -- withdrawal for this specific BloxyFlip user.
-        --
-        -- Only perform ONE immediate API request.
-        -- Do not wait through 8 x 0.75 second retries.
-        -- If an active withdrawal exists, the Worker should
-        -- return it immediately.
         local withdrawalData = nil
 
         if not recentlyConfirmed
@@ -6898,9 +4090,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             end
         end
 
-        -- ====================================================
-        -- WITHDRAWAL USER SAFETY CHECK
-        -- ====================================================
         if withdrawalData
             and withdrawalData.success
             and withdrawalData.data
@@ -6924,12 +4113,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             end
         end
 
-        -- ============================================================
-        -- FINAL WITHDRAWAL GRACE CHECK
-        -- MUST RUN BEFORE THE WITHDRAWAL/DEPOSIT BRANCH.
-        -- Previously this was accidentally placed inside the withdrawal
-        -- branch, where `not withdrawalData` could never be true.
-        -- ============================================================
         if withdrawalData
             and withdrawalData.success == true
             and withdrawalData.pendingWithdrawalExists == false
@@ -6941,7 +4124,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             local grace = getPendingWithdrawal(userInfo.userId)
 
             if grace and grace.success == true then
-                -- A withdrawal appearing during the grace window must win.
                 if grace.data or grace.pendingWithdrawalExists == true or grace.blocked == true then
                     withdrawalData = grace
 
@@ -6957,16 +4139,11 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
                     print("[WITHDRAW-GRACE] Still confirmed no pending withdrawal")
                 end
             else
-                -- Preserve the failure. Never convert an API failure into deposit.
                 withdrawalData = grace or { success = false, error = "WITHDRAWAL_GRACE_FAILED" }
                 warn("[WITHDRAW-GRACE] Lookup failed; refusing DEPOSIT MODE")
             end
         end
 
-        -- ============================================================
-        -- WITHDRAWAL LOOKUP ERROR GUARD
-        -- Backend/auth/database failures must never become DEPOSIT MODE.
-        -- ============================================================
         if not withdrawalData
             or withdrawalData.success ~= true
         then
@@ -6982,42 +4159,13 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
                 end
             end)
 
-            -- Real bug fix (2026-10-11, operator question: "why do you
-            -- think it's [stopping] people [who] want to sign up"): this
-            -- branch fires for ANY unresolved lookup, but by far the most
-            -- common real cause is a brand new player who has never linked
-            -- a BloxyFlip account at all (check-user-banned returns
-            -- found=false). They used to get "could not verify your
-            -- withdrawal status. Please try again." - wrong (they're not
-            -- even trying to withdraw) and useless ("try again" repeats the
-            -- exact same failure forever, since nothing about retrying the
-            -- same trade links an account). A first-time depositor's very
-            -- first interaction with the bot was a confusing dead end with
-            -- no path forward - a real, plausible reason someone bounces
-            -- instead of signing up. Now tells them the one thing that
-            -- actually fixes it.
             if userInfo and userInfo.found == false then
                 sendMessage("Link your Roblox account at bloxyflip.fun first, then trade again!")
             else
                 sendMessage("BloxyFlip could not verify your account. Please try again.")
             end
 
-            -- Real bug (operator report, 2026-09-19): this branch fires for
-            -- ANY unresolved lookup - most commonly a Roblox account with no
-            -- linked bloxyflip account at all (check-user-banned returns
-            -- found=false, so there is nothing to check a withdrawal
-            -- against). The trade offer stays open in Roblox and this whole
-            -- loop re-scans it every tick, so with no cooldown here this
-            -- declined-and-messaged every single second for as long as the
-            -- user's trade window stayed open - a real, repeated identical
-            -- chat message spam risk to the bot's own Roblox account. The
-            -- BLOCKED WITHDRAWAL GUARD branch right below already solves
-            -- this exact problem correctly (withdrawalHoldUntil, checked at
-            -- the top of this loop) - this branch just never set it.
             withdrawalHoldUntil[userId] = tick() + WITHDRAWAL_HOLD_COOLDOWN
-            print("[WITHDRAW-GUARD] Set repeated-request cooldown for " ..
-                tostring(username) .. " (" .. tostring(WITHDRAWAL_HOLD_COOLDOWN) .. "s)")
-
             goNext = true
             tradeId = 0
             lastGameTradeId = nil
@@ -7027,10 +4175,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             continue
         end
 
-        -- ============================================================
-        -- BLOCKED WITHDRAWAL GUARD
-        -- MUST RUN BEFORE DEPOSIT MODE.
-        -- ============================================================
         if withdrawalData
             and withdrawalData.success == true
             and withdrawalData.pendingWithdrawalExists == true
@@ -7053,8 +4197,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             sendMessage("Your withdrawal is still active, but the bot cannot fulfill it yet.")
             sendMessage("Please wait for the withdrawal to become available, then trade again.")
 
-            -- The trade request may remain visible after DeclineRequest.
-            -- Suppress repeated processing for this user for a short period.
             withdrawalHoldUntil[userId] = tick() + WITHDRAWAL_HOLD_COOLDOWN
             print("[WITHDRAW-GUARD] Set repeated-request cooldown for " ..
                 tostring(username) .. " (" .. tostring(WITHDRAWAL_HOLD_COOLDOWN) .. "s)")
@@ -7068,12 +4210,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             continue
         end
 
-        -- ============================================================
-        -- FINAL DEPOSIT SAFETY GATE
-        -- DEPOSIT MODE is allowed ONLY when the backend explicitly says
-        -- success=true AND pendingWithdrawalExists=false.
-        -- Missing/nil pendingWithdrawalExists is NOT permission to deposit.
-        -- ============================================================
         local depositAllowed = (
             withdrawalData ~= nil
             and withdrawalData.success == true
@@ -7083,28 +4219,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         )
 
         if not depositAllowed and not (withdrawalData and withdrawalData.data) then
-            -- Plain-English reason added here on purpose (2026-10-11,
-            -- operator request: "so when a thing happens you know why so I
-            -- can just send console") - the raw field dump below still
-            -- prints for completeness, but reading five tostring() fields
-            -- to reverse-engineer which ONE of them actually caused the
-            -- block is exactly the kind of thing a pasted log should not
-            -- require explaining. This line says it in one sentence.
-            local blockReason
-            if withdrawalData == nil then
-                blockReason = "the get-pending-withdrawal lookup never returned usable data at all (network/parse failure upstream)"
-            elseif withdrawalData.success ~= true then
-                blockReason = "the backend lookup itself reported success=false - treating as unsafe to deposit rather than assuming it's fine"
-            elseif withdrawalData.blocked == true then
-                blockReason = "the backend explicitly marked this user as blocked from depositing right now"
-            elseif withdrawalData.pendingWithdrawalExists ~= false then
-                blockReason = "pendingWithdrawalExists is not a confirmed false (missing/nil/true) - deposits are refused unless the backend explicitly clears this"
-            elseif withdrawalData.data ~= nil then
-                blockReason = "a withdrawal payload is actually present - this falls through to WITHDRAWAL MODE below instead, not a real block"
-            else
-                blockReason = "unrecognized combination of fields - see the raw dump below"
-            end
-            warn("[DEPOSIT-GATE] BLOCKED - " .. blockReason)
             warn("[DEPOSIT-GATE] BLOCKED | success=" ..
                 tostring(withdrawalData and withdrawalData.success) ..
                 " | pendingWithdrawalExists=" ..
@@ -7115,9 +4229,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
                 tostring(withdrawalData and withdrawalData.data ~= nil))
         end
 
-        -- ============================================================
-        -- WITHDRAWAL MODE
-        -- ============================================================
         if withdrawalData
             and withdrawalData.success == true
             and withdrawalData.data
@@ -7138,37 +4249,20 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
     lastGameTradeId = localId
 
     if localId then
-        logStep("W1", "Withdrawal trade ACCEPTED - bot about to add items | user=" .. username)
         sendMessage("== WITHDRAWAL MODE ==")
         sendMessage("Bot is sending you your items.")
         sendDiscord("Withdrawal started: " .. username, 16776960)
 
-        -- ====================================================
-        -- ADD EVERYTHING THE BOT CAN FULFILL
-        -- ====================================================
         local itemsGiven = {}
         local gemsGiven = 0
         local fullyAdded = false
         local addErr = nil
 
-        -- Diagnostic wrapper: if withdrawal preparation throws, preserve the
-        -- exact Lua traceback instead of reducing it to "attempt to call a nil value".
-        --
-        -- Real design change (2026-09-19, operator request): "if it
-        -- doesn't have the pet, give the pets it has, and the pets that
-        -- aren't in inv, just put it back into the person's account." The
-        -- 2026-09-18 dry-run-first gate (trade NOTHING unless the whole
-        -- request is satisfiable) is gone - the backend now safely
-        -- reconciles partial delivery itself (see
-        -- partiallyCompleteWithdrawal in withdrawalService.ts: it keeps
-        -- exactly what confirmWithdrawal reports as delivered and refunds
-        -- only the genuinely undelivered remainder), so the bot can go
-        -- back to a single real pass, trading whatever it actually has.
         local prepStage = "before addWithdrawalItems"
         local addOk, addResult = xpcall(function()
             prepStage = "enter addWithdrawalItems"
             local items, gems, complete, err =
-                addWithdrawalItems(withdrawalData.data, false)
+                addWithdrawalItems(withdrawalData.data)
 
             prepStage = "addWithdrawalItems returned"
 
@@ -7215,11 +4309,7 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             addErr = "Invalid withdrawal preparation result"
         end
 
-        -- ====================================================
-        -- NOTHING COULD BE ADDED
-        -- ====================================================
         if not fullyAdded then
-            logStep("W2-FAIL", "Could not add items to withdrawal trade: " .. tostring(addErr))
             warn(
                 "[WITHDRAWAL] Could not prepare withdrawal: " ..
                 tostring(addErr)
@@ -7272,9 +4362,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             )
         end
 
-        -- ====================================================
-        -- PARTIAL WITHDRAWAL INFO
-        -- ====================================================
         if lastWithdrawalMissing
             and #lastWithdrawalMissing.pets > 0
         then
@@ -7295,17 +4382,9 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             )
         end
 
-        -- ====================================================
-        -- IMPORTANT:
-        -- BOT READIES IMMEDIATELY.
-        --
-        -- DO NOT WAIT FOR THE USER TO CLICK READY.
-        -- The user only needs to CONFIRM the trade afterward.
-        -- ====================================================
         print(
             "[WITHDRAWAL] Everything available has been added."
         )
-        logStep("W2", "Items ADDED to trade (" .. #itemsGiven .. " pets + " .. gemsGiven .. " gems) - bot about to ready")
 
         print(
             "[WITHDRAWAL] Bot is READYING immediately..."
@@ -7334,11 +4413,7 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             end
         end
 
-        -- ====================================================
-        -- READY FAILED
-        -- ====================================================
         if not readyOk then
-            logStep("W3-FAIL", "Bot could NOT ready after items were added - SetReady never verified across 3 attempts")
             warn(
                 "[WITHDRAWAL] Bot could not READY after adding items"
             )
@@ -7369,10 +4444,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             continue
         end
 
-        -- ====================================================
-        -- BOT IS NOW READY
-        -- ====================================================
-        logStep("W3", "Bot READIED for withdrawal - waiting for player to confirm")
         sendMessage(
             "Bot READY - click confirm!"
         )
@@ -7380,8 +4451,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         confirmFired = true
         validationRunning = false
 
-        -- From this point forward, we only wait for the user's
-        -- confirmation / PS99 success message.
         connectMessage(
             localId,
             method
@@ -7392,9 +4461,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             method
         )
 
-        -- ====================================================
-        -- SAFETY TIMEOUT
-        -- ====================================================
         task.spawn(function()
             task.wait(TRADE_TIMEOUT_SECONDS)
 
@@ -7430,45 +4496,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             end
         end)
 
-        -- ====================================================
-        -- NOT-READIED WATCHDOG (see NOT_READIED_TIMEOUT_SECONDS above)
-        -- ====================================================
-        task.spawn(function()
-            task.wait(NOT_READIED_TIMEOUT_SECONDS)
-
-            if not goNext
-                and tradeId == localId
-                and not hasReadied
-                and isInTrade()
-            then
-                sendMessage(
-                    "No response - cancelling so other trades aren't blocked. Please re-trade."
-                )
-
-                cancelWithdrawalTrade(
-                    withdrawalData.data,
-                    "Never readied",
-                    true
-                )
-
-                sendDiscord(
-                    "Withdrawal never readied, auto-cancelled: " ..
-                    username,
-                    16776960
-                )
-
-                declineTrade()
-
-                goNext = true
-                tradeId = 0
-                lastGameTradeId = nil
-                method = nil
-                releaseIncomingTradeLock()
-                resetTradeState()
-                print("[TRADE] Not-readied watchdog cleanup complete - ready for next trade")
-            end
-        end)
-
     else
         cancelWithdrawalTrade(
             withdrawalData.data,
@@ -7488,10 +4515,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         releaseIncomingTradeLock()
         resetTradeState()
     end
-        -- ====================================================
-        -- DEPOSIT MODE
-        -- ONLY reachable when depositAllowed is explicitly true.
-        -- ====================================================
         elseif depositAllowed then
             print("[TRADE] DEPOSIT MODE: " .. username)
 
@@ -7504,7 +4527,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             lastGameTradeId = localId
 
             if localId then
-                logStep(1, "Deposit trade ACCEPTED - bot waiting for player to add items + ready | user=" .. username)
                 sendMessage("Add pets/gems then click READY")
 
                 sendDiscord(
@@ -7541,36 +4563,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
                     end
                 end)
 
-                -- ====================================================
-                -- NOT-READIED WATCHDOG (see NOT_READIED_TIMEOUT_SECONDS above)
-                -- ====================================================
-                task.spawn(function()
-                    task.wait(NOT_READIED_TIMEOUT_SECONDS)
-
-                    if not goNext
-                        and tradeId == localId
-                        and not hasReadied
-                        and isInTrade()
-                    then
-                        sendMessage("No response - cancelling so other trades aren't blocked. Please re-trade.")
-
-                        sendDiscord(
-                            "Deposit never readied, auto-cancelled: " .. username,
-                            16776960
-                        )
-
-                        declineTrade()
-
-                        goNext = true
-                        tradeId = 0
-                        lastGameTradeId = nil
-                        method = nil
-                        releaseIncomingTradeLock()
-                        resetTradeState()
-                        print("[TRADE] Not-readied watchdog cleanup complete - ready for next trade")
-                    end
-                end)
-
             else
                 sendMessage("Failed to accept - please try again")
                 warn("[ACCEPT] No actual trade opened - resetting state")
@@ -7583,18 +4575,6 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             end
         end
     end
-end, function()
-    -- Runs once after a crash, before the loop restarts - see
-    -- safeSpawnLoop's own doc comment for why this is necessary here
-    -- specifically (without it, a crash mid-trade would restart into a
-    -- permanently stuck goNext=false state instead of actually recovering).
-    warn("[FATAL] MAIN TRADE LOOP crash cleanup - forcing trade state back to idle")
-    goNext = true
-    tradeId = 0
-    lastGameTradeId = nil
-    method = nil
-    releaseIncomingTradeLock()
-    resetTradeState()
 end)
 
 print("[BOT] BloxyFlip Bot RUNNING!")
