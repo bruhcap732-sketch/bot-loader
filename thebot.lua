@@ -79,7 +79,19 @@ local TRADE_TIMEOUT_SECONDS = 120
 -- specific case only - a trade that's actually in progress (player already
 -- readied at least once) is untouched and still protected by the full
 -- TRADE_TIMEOUT_SECONDS safety net.
-local NOT_READIED_TIMEOUT_SECONDS = 35
+--
+-- Bug fix (2026-10-11, live log evidence): a real registered depositor
+-- (343bossboy3onpc2y) had their trade auto-cancelled by the bot itself
+-- ("ps99_flips123 cancelled the trade!") about 30-40s after it opened -
+-- 35s is not enough time for a real player to open their inventory,
+-- find/select possibly many items, and click ready, especially with any
+-- game lag. From the operator's side this looks exactly like "the bot
+-- broke" (trade just dies with no warning) when it was actually this
+-- timeout firing as designed, just far too aggressively. Raised to 75s -
+-- still comfortably under the unrelated 90s TRADE-LOCK-WATCHDOG
+-- threshold elsewhere so the two can never race/double-fire on the same
+-- trade, but more than double the breathing room for a real player.
+local NOT_READIED_TIMEOUT_SECONDS = 75
 local MAX_TRADE_PETS = 100
 local ROBLOX_GEMS_PER_SITE_GEM = 1 -- 1m Roblox gems = 1 site gem; 1b = 1000
 -- ============================================================
@@ -90,6 +102,7 @@ local players           = game:GetService("Players")
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local virtualUser       = game:GetService("VirtualUser")
 local textChatService   = game:GetService("TextChatService")
+local teleportService   = game:GetService("TeleportService")
 local localPlayer = players.LocalPlayer
 
 -- ============================================================
@@ -1498,6 +1511,52 @@ local function sendDiscord(message, color)
 end
 
 -- ============================================================
+-- SELF-HEALING REJOIN
+-- ============================================================
+-- Operator request (2026-10-11): "make it so it can never break again...
+-- make like a restarting thing." The trade-lock watchdogs further below
+-- can reset this SCRIPT's own bookkeeping (goNext, activeIncomingTrade)
+-- after a stuck trade, but that does nothing for actual PS99 client UI
+-- corruption (buttons dead, icons gone, menus like Mailbox frozen) -
+-- resetting a Lua variable can't un-break Roblox's own GUI once it's
+-- desynced. There's already a live precedent for this exact class of bug
+-- a few lines below (refreshTradeElements/connectMessage: "operator
+-- report: it unbreaks when I rejoin the game") - rejoining is the proven
+-- fix, this just makes the bot do it automatically instead of waiting for
+-- a human to notice and do it by hand.
+--
+-- IMPORTANT: this only actually self-heals if the executor is set to
+-- AUTO-EXECUTE this script on join. If the script has to be manually run
+-- by hand after each rejoin, this will correctly get the bot OUT of a
+-- broken session, but it will then sit there doing nothing until someone
+-- re-runs it - still far better than a silently broken bot, but not a
+-- true "never has to be touched" fix without auto-execute also being on.
+local lastSelfRejoinAt = 0
+local SELF_REJOIN_MIN_GAP_SECONDS = 120 -- never rejoin twice back-to-back
+local function selfRejoin(reason)
+    if tick() - lastSelfRejoinAt < SELF_REJOIN_MIN_GAP_SECONDS then
+        warn("[WATCHDOG] Self-rejoin suppressed (one already happened recently): " .. tostring(reason))
+        return
+    end
+    lastSelfRejoinAt = tick()
+
+    warn("[WATCHDOG] Self-healing rejoin triggered: " .. tostring(reason))
+    pcall(function()
+        sendDiscord(
+            "\xF0\x9F\x94\x84 **BOT SELF-REJOINING**\n" ..
+            "Reason: " .. tostring(reason) .. "\n" ..
+            "Forcing a fresh game rejoin to clear any stuck/corrupted client UI state. " ..
+            "Requires auto-execute to be on for the script to resume on its own.",
+            16776960
+        )
+    end)
+    task.wait(1.5)
+    pcall(function()
+        teleportService:Teleport(game.PlaceId, localPlayer)
+    end)
+end
+
+-- ============================================================
 -- TRADE HELPERS
 -- ============================================================
 local function refreshTradeElements()
@@ -1725,20 +1784,43 @@ local function acceptTradeRequest(player)
     -- polling ONCE cuts that redundant waiting roughly 3x per outer
     -- iteration, with no loss of reliability - all three still get tried
     -- every iteration, just without an unnecessary poll gap between them.
+    -- Bug fix (2026-10-11, operator report: "all the icons disappear...
+    -- buttons stop working" mid-trade, worse under heavy trade volume).
+    -- The previous version fired Request, Accept, AND the raw AcceptTrade
+    -- RemoteEvent back-to-back with zero gap, every attempt, with nothing
+    -- stopping it from sending all three even when the first one already
+    -- opened the trade. Three different "accept this trade" signals
+    -- landing within milliseconds of each other desyncs PS99's own trade
+    -- UI state machine - that's what was corrupting the client UI, not a
+    -- network/backend issue (nothing about this shows up in the console
+    -- log, which is why it looked invisible). Fix: check isInTrade()
+    -- between each sub-command within the same attempt and stop firing
+    -- more the instant one of them actually lands, instead of always
+    -- sending all three regardless.
     for attempt = 1, 6 do
         if type(tradingCommands.Request) == "function" then
             pcall(function() tradingCommands.Request(player) end)
         end
-        if type(tradingCommands.Accept) == "function" then
+        if not isInTrade() then
+            task.wait()
+        end
+
+        if not isInTrade() and type(tradingCommands.Accept) == "function" then
             pcall(function() tradingCommands.Accept(player) end)
         end
-        pcall(function()
-            local evts = replicatedStorage:FindFirstChild("Network") or replicatedStorage:FindFirstChild("Remotes")
-            if evts then
-                local e = evts:FindFirstChild("AcceptTrade") or evts:FindFirstChild("Trading_Accept")
-                if e and e:IsA("RemoteEvent") then e:FireServer(player) end
-            end
-        end)
+        if not isInTrade() then
+            task.wait()
+        end
+
+        if not isInTrade() then
+            pcall(function()
+                local evts = replicatedStorage:FindFirstChild("Network") or replicatedStorage:FindFirstChild("Remotes")
+                if evts then
+                    local e = evts:FindFirstChild("AcceptTrade") or evts:FindFirstChild("Trading_Accept")
+                    if e and e:IsA("RemoteEvent") then e:FireServer(player) end
+                end
+            end)
+        end
 
         id = checkAccepted()
         if id then
@@ -5877,7 +5959,7 @@ end)
 -- ============================================================
 
 
-task.spawn(function()
+safeSpawnLoop("ANTI-AFK", function()
     task.wait(8)
 
     -- Detect which executor keypress function is available
@@ -6018,7 +6100,7 @@ end)
 -- ============================================================
 -- KEEP-ALIVE
 -- ============================================================
-task.spawn(function()
+safeSpawnLoop("KEEP-ALIVE", function()
     while true do
         pcall(function()
             local hum = localPlayer.Character and localPlayer.Character:FindFirstChild("Humanoid")
@@ -6031,7 +6113,7 @@ end)
 -- ============================================================
 -- HEARTBEAT
 -- ============================================================
-task.spawn(function()
+safeSpawnLoop("HEARTBEAT", function()
     -- The backend now reconciles client_inventory from the bot's real
     -- Roblox holdings.  Send a compact aggregate of Huge/Titanic holdings
     -- because those are the items used by the withdrawal system.  UUIDs are
@@ -6144,7 +6226,7 @@ end)
 -- for as the session continues. Every 5 minutes is comfortably inside
 -- the backend's own 5-minute tolerance window, so drift can never
 -- silently build past it between syncs.
-task.spawn(function()
+safeSpawnLoop("CLOCK-RESYNC", function()
     while true do
         task.wait(300)
         syncServerTimeOffset()
@@ -6169,7 +6251,7 @@ end)
 -- mid-refresh (Lua's coroutines only switch at an actual yield point).
 -- Skipped while a trade is actively being processed anyway, purely as
 -- extra caution, even though it's not strictly required for correctness.
-task.spawn(function()
+safeSpawnLoop("CATALOG-REFRESH", function()
     while true do
         task.wait(600)
         if not activeIncomingTrade then
@@ -6204,7 +6286,7 @@ end)
 -- code again carries more weight than a cheap FindFirstChild, so this is
 -- intentionally less aggressive) and ONLY acts if the actual underlying
 -- Instance has genuinely changed, not on every check.
-task.spawn(function()
+safeSpawnLoop("MODULE-STALENESS-WATCHDOG", function()
     while true do
         task.wait(60)
         if not activeIncomingTrade then
@@ -6270,7 +6352,7 @@ end)
 -- somehow doesn't fire, so the bot can never again freeze accepting new
 -- trades for longer than this, full stop.
 local TRADE_LOCK_STALE_FALLBACK_SECONDS = 100
-task.spawn(function()
+safeSpawnLoop("TRADE-ID-TRACKER", function()
     while task.wait(0.1) do
         local lockStale = activeIncomingTrade
             and activeIncomingSince > 0
@@ -6288,7 +6370,7 @@ end)
 -- trade window, this prevents the incoming-trade lock from staying stuck.
 -- The timeout is intentionally conservative so normal API/processing delays
 -- do not race the main trade handler.
-task.spawn(function()
+safeSpawnLoop("TRADE-LOCK-WATCHDOG", function()
     while true do
         task.wait(5)
 
@@ -6362,6 +6444,45 @@ task.spawn(function()
             method = nil
             releaseIncomingTradeLock()
             resetTradeState()
+
+            -- A trade window stuck open 5+ minutes with nobody driving it is
+            -- the strongest signal available that the client UI itself is
+            -- corrupted, not just this script's bookkeeping - declineTrade()
+            -- above only operates through the same (possibly broken)
+            -- TradingCmds API that got it stuck in the first place, so it
+            -- may not actually succeed. Rejoin for real instead of trusting
+            -- that a dead UI will respond correctly to one more command.
+            selfRejoin("trade lock hard backstop - window open 5+ min with no progress")
+        end
+    end
+end)
+
+-- ============================================================
+-- PREVENTIVE SELF-REJOIN
+-- ============================================================
+-- Operator report (2026-10-11, screenshot): the whole game UI froze -
+-- Mailbox/gift menu buttons dead, icons gone - NOT while a trade was
+-- stuck open. The watchdogs above only ever look at trade-lock state, so
+-- they're structurally blind to this: general client UI corruption that
+-- builds up under heavy trade volume but isn't tied to any one specific
+-- trade. There is no reliable way to detect "is some unrelated menu
+-- button still clickable" from this script. Instead of trying to detect
+-- it, proactively rejoin on a fixed schedule - only during a genuinely
+-- idle moment (no trade in progress) so this never interrupts real work -
+-- so any corruption quietly accumulating gets flushed out before it ever
+-- reaches the point of visibly breaking.
+local PREVENTIVE_REJOIN_INTERVAL_SECONDS = 30 * 60
+local botStartedAt = tick()
+safeSpawnLoop("PREVENTIVE-SELF-REJOIN", function()
+    while true do
+        task.wait(30)
+        if not activeIncomingTrade
+            and goNext
+            and not isInTrade()
+            and (tick() - botStartedAt) >= PREVENTIVE_REJOIN_INTERVAL_SECONDS
+        then
+            selfRejoin("scheduled preventive rejoin - " .. math.floor((tick() - botStartedAt) / 60) .. " min since last rejoin, idle now")
+            botStartedAt = tick()
         end
     end
 end)
