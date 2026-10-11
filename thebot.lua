@@ -3452,37 +3452,6 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             return
         end
 
-        -- CV-GATE, confirm-stage (ported from thebot.lua): last checkpoint
-        -- before SetConfirmed actually completes the trade and the
-        -- player's pet is gone for good. Should rarely trip since cvCache
-        -- keeps this re-read of the same items consistent with the ready
-        -- stage's gate above, but it's cheap insurance against any path
-        -- that could otherwise let an unpriced accepted-tier pet through
-        -- to a real 0-credit deposit.
-        if not isWithdraw then
-            local missingCosmicAtConfirm = nil
-            for _, it in ipairs(confirmItems) do
-                if it.isAcceptedTier and it.cosmicValue == nil then
-                    missingCosmicAtConfirm = it.displayName
-                    break
-                end
-            end
-            if missingCosmicAtConfirm then
-                warn("[CV-GATE] Declining at confirm stage - no Cosmic Value read for " .. tostring(missingCosmicAtConfirm))
-                sendMessage("Could not confirm Cosmic Value for " .. tostring(missingCosmicAtConfirm) .. " - cancelling for safety. Please re-trade.")
-                sendDiscord("⚠️ **CV-GATE (confirm stage)**\n**Player:** " .. tostring(lastTradeUsername) ..
-                    "\n**Item:** " .. tostring(missingCosmicAtConfirm) ..
-                    "\nTrade cancelled - no Cosmic Value read.", 16776960)
-                tradeCancelled = true
-                tradeProcessed = true
-                declineTrade()
-                goNext = true
-                releaseIncomingTradeLock()
-                resetTradeState()
-                return
-            end
-        end
-
         lastTradeItems = confirmItems
         lastTradeGems  = confirmGems
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
@@ -3565,34 +3534,10 @@ local function connectStatus(localId, tradeMethod)
 
                 if tradeMethod == "deposit" then
                     local hasError, output = checkItems()
-
-                    -- CV-GATE (ported from thebot.lua): if an accepted-tier
-                    -- pet (Huge/Titanic/Gargantuan, any variant) made it
-                    -- through checkItems with no Cosmic Value read at all,
-                    -- refuse to ready the trade rather than let it proceed
-                    -- toward a 0-credit deposit. A flaky CV read should
-                    -- cost the player a re-trade, never a pet's real value.
-                    local missingCosmicName = nil
-                    if not hasError then
-                        for _, it in ipairs(output) do
-                            if it.isAcceptedTier and it.cosmicValue == nil then
-                                missingCosmicName = it.displayName
-                                break
-                            end
-                        end
-                    end
-
                     if hasError then
                         sendMessage(tostring(output))
                         pcall(function() tradingCommands.SetReady(false) end)
 
-                        wasReady = true
-                        task.wait(1)
-                    elseif missingCosmicName then
-                        warn("[CV-GATE] Declining at ready stage - no Cosmic Value read for " .. tostring(missingCosmicName))
-                        sendMessage("Could not read Cosmic Value for " .. tostring(missingCosmicName) .. " - please remove it and re-ready, or try again.")
-                        pcall(function() tradingCommands.SetReady(false) end)
-                        validationRunning = false
                         wasReady = true
                         task.wait(1)
                     else
