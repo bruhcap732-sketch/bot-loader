@@ -1202,6 +1202,38 @@ local function refreshTradeElements()
                 end
             end
         end
+
+        -- Defensive hardening (2026-10-10, same class of bug just found and
+        -- fixed for tradingMessage - see connectMessage's own doc comment
+        -- for the live incident). tradingWindow itself is resolved ONCE at
+        -- script startup and never re-fetched anywhere else in the file.
+        -- No live evidence has shown TradeWindow itself going stale the way
+        -- the Message popup did, but if it ever does (a game update, an
+        -- unusual reconnect, anything), BOTH the direct FindFirstChild AND
+        -- the GetDescendants() fallback above would keep failing forever
+        -- against a dead instance with no live descendants, silently
+        -- breaking every single trade for the rest of this bot's uptime
+        -- with no way to recover short of a manual restart. One cheap
+        -- re-fetch attempt from playerGUI before giving up costs nothing on
+        -- the normal/working path (only runs when the frame lookup already
+        -- failed) and closes off this entire class of failure the same way
+        -- the Message fix did.
+        if not frame then
+            local freshWindow = playerGUI:FindFirstChild("TradeWindow")
+            if freshWindow and freshWindow ~= tradingWindow then
+                tradingWindow = freshWindow
+                frame = tradingWindow:FindFirstChild("Frame")
+                if not frame then
+                    for _, obj in ipairs(tradingWindow:GetDescendants()) do
+                        if obj:IsA("Frame") and obj.Name == "Frame" then
+                            frame = obj
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
         if not frame then return end
         tradingFrame = frame
 
@@ -5091,9 +5123,29 @@ end
 -- actually completed, causing incorrect deposits/withdrawals.
 -- ============================================================
 local function connectMessage(localId, tradeMethod)
-    if not tradingMessage then
-        tradingMessage = playerGUI:FindFirstChild("Message")
-    end
+    -- Real bug fix (2026-10-10, THE operator pattern reported all night:
+    -- "works the first time, then breaks after multiple trades" - live
+    -- evidence confirmed it: a deposit's items genuinely left in Roblox
+    -- (proven by the player's own Trade History showing it completed),
+    -- the bot's own SetConfirmed retries all failed to verify, and NO
+    -- message was ever detected - not success, not even "unrecognized" -
+    -- total silence from this listener for a trade that definitely
+    -- finished. This used to only re-fetch tradingMessage when it was nil
+    -- - but it starts as a real, non-nil object (resolved once at script
+    -- load, near the top of the file) and was then NEVER refreshed again
+    -- for the rest of the bot's uptime. If PS99 destroys and recreates
+    -- its "Message" popup GUI object between trades (a completely normal
+    -- pattern for popup/dialog UI), this reference goes stale after the
+    -- FIRST trade - still a valid, non-nil Lua object, just pointing at a
+    -- dead instance disconnected from the live GUI tree. Every trade
+    -- after that was connecting its completion listener to a popup that
+    -- would never receive another real event again, while PS99 kept
+    -- showing real messages on a completely different, newer instance
+    -- this script never looked at again. Always re-resolving it fresh
+    -- here, every single trade, closes that gap entirely - FindFirstChild
+    -- is cheap, there's no real cost to doing this every time instead of
+    -- only once.
+    tradingMessage = playerGUI:FindFirstChild("Message") or tradingMessage
     if not tradingMessage then
         warn("[MSG] tradingMessage not found - bot cannot detect trade completion!")
         sendDiscord("⚠️ **WARNING**: tradingMessage GUI not found - bot cannot detect trade completion for " .. tostring(lastTradeUsername), 16711680)
@@ -5145,8 +5197,29 @@ local function connectMessage(localId, tradeMethod)
             resetTradeState()
 
         elseif text ~= "" then
-            -- Unknown message — log it so we can diagnose unexpected states
+            -- Real bug fix (2026-10-10, live operator report/evidence: a
+            -- deposit was fully validated, the bot retried SetConfirmed 4
+            -- real times and still couldn't verify it, and no success
+            -- message ever printed afterward - yet the player's own Roblox
+            -- Trade History proved the trade genuinely completed in-game.
+            -- The pets were really gone, the site never credited them, and
+            -- this listener never even logged a success OR an unrecognized
+            -- message in between - total silence). This handler only fires
+            -- on tradingMessage's Enabled property actually CHANGING
+            -- (GetPropertyChangedSignal("Enabled")). The success/cancel
+            -- branches above both explicitly reset Enabled back to false
+            -- after handling their message - this branch never did. If an
+            -- earlier message of some OTHER unrecognized kind appeared
+            -- during the same trade and left Enabled sitting at true, then
+            -- PS99 later changing only the TEXT (not re-toggling Enabled)
+            -- for the real "Trade successfully completed!" message would
+            -- never produce a false->true transition for this listener to
+            -- catch - the success text could appear and be completely
+            -- invisible to this bot. Resetting Enabled=false here too
+            -- guarantees the next real message, whatever it is, always
+            -- gets a fresh transition.
             print("[MSG] Unrecognised message (ignoring): '" .. text .. "'")
+            pcall(function() tradingMessage.Enabled = false end)
         end
     end)
 
