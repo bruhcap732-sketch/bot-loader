@@ -252,6 +252,20 @@ do
     local resetLabelAt = 0
     local fullResetLabelAt = 0
 
+    -- Operator report (2026-10-11): copying the ENTIRE session file in one
+    -- setclipboard call could crash the game once a session ran long
+    -- enough to pass ~5000 lines - a single multi-hundred-KB clipboard
+    -- write is apparently too much for the client to handle at once.
+    -- Paged instead: each F6 press copies one CHUNK_LINES-line slice of
+    -- the file, starting from the END (most recent activity - usually
+    -- what you actually need) and working backward in time on each
+    -- subsequent press, wrapping back to the most recent chunk once it
+    -- runs out of older lines. The button/console label always says which
+    -- chunk and line range you just got, so pasting multiple chunks
+    -- stays unambiguous about what's covered.
+    local CHUNK_LINES = 4000
+    local fullLogChunkIndex = 0
+
     local function copyLogs()
         local text = table.concat(logBuffer, "\n")
 
@@ -284,12 +298,52 @@ do
         else
             local ok, content = pcall(readfile, LOG_FILE)
             if ok and content then
-                local clipOk = pcall(setClip, content)
-                local lineCount = select(2, content:gsub("\n", "\n")) + 1
-                fullButton.Text = clipOk and ("Copied! (~" .. lineCount .. " lines)") or "Copy failed"
-                if not clipOk then
-                    warn("[LOG-COPY] setclipboard call threw an error for full log")
+                -- Split into lines once per press rather than keeping a
+                -- parallel in-memory copy of the whole file at all times -
+                -- this file only grows across a long session, so re-reading
+                -- it fresh on each press also means a chunk always reflects
+                -- whatever's actually on disk right now.
+                local lines = {}
+                for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+                    table.insert(lines, line)
                 end
+
+                local totalLines = #lines
+                local totalChunks = math.max(1, math.ceil(totalLines / CHUNK_LINES))
+
+                -- Wrap back to the most recent chunk (index 0) once past
+                -- the oldest one, rather than erroring or sticking.
+                if fullLogChunkIndex >= totalChunks then
+                    fullLogChunkIndex = 0
+                end
+
+                -- Chunk 0 = the LAST CHUNK_LINES lines (most recent activity).
+                -- Chunk 1 = the CHUNK_LINES lines before that. And so on,
+                -- walking backward in time with each press.
+                local endLine = totalLines - (fullLogChunkIndex * CHUNK_LINES)
+                local startLine = math.max(1, endLine - CHUNK_LINES + 1)
+
+                local chunkLines = {}
+                for i = startLine, endLine do
+                    table.insert(chunkLines, lines[i])
+                end
+                local chunkText = table.concat(chunkLines, "\n")
+
+                local clipOk = pcall(setClip, chunkText)
+                local chunkNumber = fullLogChunkIndex + 1
+                fullButton.Text = clipOk
+                    and ("Copied " .. chunkNumber .. "/" .. totalChunks .. "!")
+                    or "Copy failed"
+                if clipOk then
+                    print("[LOG-COPY] F6 copied chunk " .. chunkNumber .. "/" .. totalChunks ..
+                        " (lines " .. startLine .. "-" .. endLine .. " of " .. totalLines .. " total" ..
+                        (chunkNumber == 1 and ", most recent first" or "") ..
+                        ") - press F6 again for the next chunk further back in time")
+                else
+                    warn("[LOG-COPY] setclipboard call threw an error for full log chunk " .. chunkNumber)
+                end
+
+                fullLogChunkIndex = fullLogChunkIndex + 1
             else
                 fullButton.Text = "Read failed"
                 warn("[LOG-COPY] Could not read " .. LOG_FILE .. ": " .. tostring(content))
@@ -317,7 +371,9 @@ do
         end
     end)
 
-    print("[LOG-COPY] Ready - F5 copies the recent in-memory log (~" .. LOG_BUFFER_MAX .. " lines), F6 copies the COMPLETE session log from disk (never drops older lines, use this for anything that happened a while ago)" ..
+    print("[LOG-COPY] Ready - F5 copies the recent in-memory log (~" .. LOG_BUFFER_MAX .. " lines). " ..
+        "F6 copies the full on-disk session log in " .. CHUNK_LINES .. "-line chunks (most recent first) - " ..
+        "press it once for the latest chunk, press again for the one before that, and so on; wraps back to the most recent after the oldest chunk" ..
         (hasFileApi and "" or " [F6 unavailable: no writefile/appendfile in this executor]"))
 end
 
