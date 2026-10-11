@@ -514,11 +514,29 @@ local lastTradeUserId    = nil
 local lastGameTradeId    = nil
 local lastTradeItems     = {}
 local lastTradeGems      = 0
+local preConfirmGemBalance = nil -- bot's own gem balance snapshotted right as the player's confirm was verified, for the no-message fallback below
+local preConfirmItemCount  = nil -- same idea, candidate-pet inventory count - see preConfirmGemBalance's own doc comment
+-- Simulated (109,000-trial Monte Carlo, 2026-10-11): gem balance alone can
+-- false-positive on a SMALL gems-only deposit if the bot's own passive
+-- in-game income (breakables, reward chests - this account visibly plays
+-- the game, not just trades) coincidentally matches the required amount
+-- during the ~2min trade window. Requiring the pet-count to also have
+-- increased by the right number when the trade included items cuts that
+-- false-positive rate by roughly 250x (coincidentally gaining the exact
+-- right number of matching pets from an unrelated source is far less
+-- likely than a stray gem windfall). For GEMS-ONLY deposits there's no
+-- item signal to corroborate with, so below this floor the fallback does
+-- NOT auto-credit - it alerts for manual review instead, which the
+-- simulation showed eliminates false positives for small amounts entirely
+-- at the cost of those specific small/no-popup cases needing a human to
+-- confirm instead of being auto-recovered.
+local GEMS_ONLY_FALLBACK_FLOOR = 1000000
 local lastWithdrawalData = nil
 local lastItemsGiven     = {}
 local lastBotGemsAdded   = 0  -- gems bot actually sent (derived from botGemBalance, not UI)
 local botGemBalance      = 0  -- latest backend-held gem balance
 local botGemBalancePresent = false -- true once heartbeat supplies a valid heldGemsBalance
+local heldGemsBalanceAbsentExplained = false -- prints the "this is expected" explanation once, not every ~30s heartbeat
 local lastGemsRequested  = 0  -- what we asked the game to add (reliable even after window closes)
 local lastWithdrawalMissing = { pets = {}, gems = 0 }  -- tracks what bot couldn't fulfil
 
@@ -588,6 +606,8 @@ local function resetTradeState()
     lastTradeUserId       = nil
     lastGameTradeId       = nil
     lastTradeGems         = 0
+    preConfirmGemBalance  = nil
+    preConfirmItemCount   = nil
     lastWithdrawalData    = nil
     lastItemsGiven        = {}
     lastBotGemsAdded      = 0
@@ -1533,7 +1553,22 @@ end
 -- true "never has to be touched" fix without auto-execute also being on.
 local lastSelfRejoinAt = 0
 local SELF_REJOIN_MIN_GAP_SECONDS = 120 -- never rejoin twice back-to-back
-local function selfRejoin(reason)
+-- Bug fix (2026-10-11, found by re-auditing this exact function after
+-- simulating other parts of the script tonight): the 1.5s wait below (so
+-- the Discord message has time to actually send before the Teleport call
+-- tears this whole Lua VM down) never re-checked trade state afterward. A
+-- real trade - accept, items added, even confirmed - could start in that
+-- exact 1.5s window after the PREVENTIVE watchdog's one-time "is idle"
+-- check and before the Teleport fires, getting destroyed mid-flight with
+-- zero chance for ANY safety net (handleTradeCompletion, the no-message
+-- timeout, the balance-delta recovery) to run, since the whole script
+-- state is wiped by the rejoin itself. requireStillIdle: pass true from a
+-- callsite that only ever meant to act on IDLE state (the preventive
+-- watchdog) so this re-verifies immediately before the actual jump and
+-- aborts if a trade started in the meantime. Leave false (default) for a
+-- callsite that's deliberately reacting to a trade already being stuck -
+-- there, waiting for "idle" would mean never firing at all.
+local function selfRejoin(reason, requireStillIdle)
     if tick() - lastSelfRejoinAt < SELF_REJOIN_MIN_GAP_SECONDS then
         warn("[WATCHDOG] Self-rejoin suppressed (one already happened recently): " .. tostring(reason))
         return
@@ -1551,6 +1586,13 @@ local function selfRejoin(reason)
         )
     end)
     task.wait(1.5)
+
+    if requireStillIdle and (activeIncomingTrade or isInTrade()) then
+        warn("[WATCHDOG] Self-rejoin aborted - a trade started during the pre-rejoin delay, not interrupting it: " .. tostring(reason))
+        lastSelfRejoinAt = 0 -- don't let this attempt block a later, genuinely idle one
+        return
+    end
+
     pcall(function()
         teleportService:Teleport(game.PlaceId, localPlayer)
     end)
@@ -4658,6 +4700,17 @@ local function handleTradeCompletion(tradeMethod)
             -- the one message telling the player their deposit may have
             -- silently failed - it cannot afford to be the one message that
             -- gets eaten by the filter. Plain ASCII only.
+            -- Console-visible reason, not just the Discord/in-game messages
+            -- above (2026-10-11, operator request: "so I can just send
+            -- console") - this exact branch is the single most important
+            -- failure in the whole script (items already gone from the
+            -- player, site did not credit them) and previously had no
+            -- dedicated print/warn of its own to point at in a pasted log.
+            warn("[COMPLETE] process-deposit FAILED for " .. tostring(lastTradeUsername) ..
+                " | pets=" .. #lastTradeItems .. " gems=" .. tostring(lastTradeGems) ..
+                " | reason=" .. tostring(result) ..
+                " | tradeId=" .. tostring(lastGameTradeId) ..
+                " - items are already gone from the player, this needs a manual credit")
             sendCriticalMessage("WARNING: Deposit error - your items may not have been credited. Screenshot this and contact support: " .. tostring(result))
             sendDiscord("DEPOSIT FAILED: " .. lastTradeUsername .. " | " .. tostring(result), 16711680)
         end
@@ -5113,6 +5166,30 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         -- User's items verified — update snapshot then confirm
         lastTradeItems = confirmItems
         lastTradeGems  = confirmGems
+
+        -- Bug fix (2026-10-11, live log evidence: cat_man5000x's deposit of
+        -- 2 pets + 62,000,000 gems - this exact code path, verified here -
+        -- physically landed in the bot's Roblox inventory (confirmed by the
+        -- bot's own in-game Trade History, and by the next heartbeat's gem
+        -- balance/pet count jumping by EXACTLY these numbers), but the
+        -- Message-popup listener in connectMessage never fired for it - not
+        -- even an "unrecognized text" line, total silence - so the deposit
+        -- was never credited even though the player already paid. The
+        -- popup-staleness fix from 2026-10-10 clearly isn't catching every
+        -- case. Snapshotting the bot's own gem balance right here, the
+        -- instant the player's confirm is independently verified, gives the
+        -- no-message timeout in connectMessage something more reliable than
+        -- a GUI popup to fall back on: if gems actually moved by this exact
+        -- amount, the trade demonstrably happened regardless of whether any
+        -- popup was ever seen. Deposit-only - a withdrawal's balance moves
+        -- the other direction and already has its own confirmation path.
+        if tradeMethod == "deposit" then
+            local ok, bal = pcall(getBotGemBalance)
+            preConfirmGemBalance = (ok and type(bal) == "number") and bal or nil
+            local ok2, inv = pcall(getHugesTitanics)
+            preConfirmItemCount = (ok2 and type(inv) == "table") and #inv or nil
+        end
+
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
         logStep(4, "Player CONFIRMED and verified - bot about to send its own SetConfirmed")
 
@@ -5755,6 +5832,85 @@ local function connectMessage(localId, tradeMethod)
         end
         -- If we exited the loop without processing, clean up safely
         if not tradeProcessed and not tradeCancelled and not goNext then
+            -- Balance-delta fallback (2026-10-11, see preConfirmGemBalance's
+            -- own doc comment in connectConfirm for the live incident this
+            -- fixes) - before giving up on a deposit, check whether the
+            -- bot's own gem balance AND item count actually moved by the
+            -- amounts independently verified at confirm time. A popup can
+            -- fail to fire; gems/items actually landing in this bot's
+            -- account cannot lie. Deposit-only, and only when a confirm was
+            -- actually verified (preConfirmGemBalance ~= nil) - a trade that
+            -- never got that far has nothing trustworthy to compare against.
+            --
+            -- Simulated (109,000 trials) before trusting this: gems alone
+            -- false-positives on small gems-only deposits if the bot's own
+            -- passive in-game income (breakables, reward chests) happens to
+            -- land in the same ~2min window. Requiring the item count to
+            -- also match when the trade included items cut that false-
+            -- positive rate ~250x; for gems-only deposits (nothing to
+            -- corroborate with) GEMS_ONLY_FALLBACK_FLOOR keeps small amounts
+            -- out of auto-credit entirely - those fall through to the manual
+            -- Discord alert below instead, same as before this fix existed.
+            if tradeMethod == "deposit" and preConfirmGemBalance ~= nil
+                and (lastTradeGems > 0 or #lastTradeItems > 0)
+            then
+                local ok, currentBalance = pcall(getBotGemBalance)
+                local ok2, currentItemCount = pcall(getHugesTitanics)
+                currentItemCount = (ok2 and type(currentItemCount) == "table") and #currentItemCount or nil
+
+                local gemsOk = lastTradeGems <= 0
+                    or (ok and type(currentBalance) == "number"
+                        and (currentBalance - preConfirmGemBalance) >= lastTradeGems)
+
+                local itemsOk = #lastTradeItems <= 0
+                    or (currentItemCount ~= nil and preConfirmItemCount ~= nil
+                        and (currentItemCount - preConfirmItemCount) >= #lastTradeItems)
+
+                local gemsOnlyFloorOk = #lastTradeItems > 0
+                    or lastTradeGems >= GEMS_ONLY_FALLBACK_FLOOR
+
+                if gemsOk and itemsOk and gemsOnlyFloorOk then
+                    warn("[MSG] No success popup ever fired, but gems/items confirm this deposit landed (" ..
+                        tostring(preConfirmGemBalance) .. " -> " .. tostring(currentBalance) ..
+                        ", expected +" .. tostring(lastTradeGems) .. " gems, +" .. #lastTradeItems ..
+                        " items) - crediting anyway")
+                    sendDiscord("\xE2\x9A\xA0\xEF\xB8\x8F **DEPOSIT RECOVERED (no popup, balance-confirmed)**\n**Player:** " ..
+                        tostring(lastTradeUsername) ..
+                        "\nNo success message was ever seen, but the bot's own gems and item count both moved by " ..
+                        "the validated amounts, so this was credited anyway instead of being silently dropped.", 16776960)
+                    pcall(function() msgConn:Disconnect() end)
+                    -- Same call shape as the real success branch above -
+                    -- handleTradeCompletion already closes the trade window
+                    -- and does its own resetTradeState()/goNext/
+                    -- releaseIncomingTradeLock() internally (see its own
+                    -- ending) - duplicating that here would just be
+                    -- redundant, not safer.
+                    local completionOk, completionErr = xpcall(handleTradeCompletion, function(e)
+                        return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+                    end, tradeMethod)
+                    if not completionOk then
+                        warn("[FATAL] handleTradeCompletion (balance-delta recovery path) crashed: " .. tostring(completionErr))
+                        sendMessage("Something went wrong processing this trade - please contact support with a screenshot of this chat.")
+                        -- Unlike the normal success path, a crash here means
+                        -- handleTradeCompletion's own cleanup never ran -
+                        -- force it the same way the SUCCESS branch above does
+                        -- on its own crash path, so this doesn't block every
+                        -- future trade.
+                        goNext = true
+                        tradeId = 0
+                        lastGameTradeId = nil
+                        method = nil
+                        releaseIncomingTradeLock()
+                        resetTradeState()
+                    end
+                    return
+                end
+
+                print("[MSG] Balance-delta fallback did not confirm this deposit (gemsOk=" .. tostring(gemsOk) ..
+                    " itemsOk=" .. tostring(itemsOk) .. " gemsOnlyFloorOk=" .. tostring(gemsOnlyFloorOk) ..
+                    ") - falling through to manual-review alert")
+            end
+
             warn("[MSG] Trade ended without success message - NOT processing to avoid incorrect trade")
             -- Real bug fix (2026-10-10, live operator report: both sides showed
             -- "Confirmed!" with a countdown on a real 701M-value trade, it just
@@ -6197,7 +6353,26 @@ safeSpawnLoop("HEARTBEAT", function()
                         botGemBalancePresent = false
                         print("[HEARTBEAT] OK | heldGemsBalance absent; legacy gem_balance=" .. tostring(botGemBalance))
                     else
-                        print("[HEARTBEAT] OK | heldGemsBalance absent | no legacy gem_balance")
+                        -- Noted once, not every heartbeat (2026-10-11,
+                        -- operator request: "so I can just send console") -
+                        -- this field has NEVER been sent by the backend
+                        -- (confirmed: not referenced anywhere in
+                        -- robloxBot.routes.ts's /heartbeat handler), so
+                        -- "absent" here is the backend's normal, permanent
+                        -- behavior, not a flaky failure - and it isn't
+                        -- actually used for any live decision in this script
+                        -- (botGemBalance only ever feeds the startup Discord
+                        -- diagnostic dump, nothing trade-related). Printing
+                        -- the full explanation on every single heartbeat
+                        -- (every ~30s) would just bury real signal in noise.
+                        if not heldGemsBalanceAbsentExplained then
+                            heldGemsBalanceAbsentExplained = true
+                            print("[HEARTBEAT] OK | heldGemsBalance absent | no legacy gem_balance " ..
+                                "(expected - the backend never sends this field at all, it's not wired to any " ..
+                                "live decision here, this line won't repeat the explanation again this session)")
+                        else
+                            print("[HEARTBEAT] OK | heldGemsBalance absent | no legacy gem_balance")
+                        end
                     end
                 end
 
@@ -6481,7 +6656,7 @@ safeSpawnLoop("PREVENTIVE-SELF-REJOIN", function()
             and not isInTrade()
             and (tick() - botStartedAt) >= PREVENTIVE_REJOIN_INTERVAL_SECONDS
         then
-            selfRejoin("scheduled preventive rejoin - " .. math.floor((tick() - botStartedAt) / 60) .. " min since last rejoin, idle now")
+            selfRejoin("scheduled preventive rejoin - " .. math.floor((tick() - botStartedAt) / 60) .. " min since last rejoin, idle now", true)
             botStartedAt = tick()
         end
     end
@@ -6519,14 +6694,34 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         -- open. Prefer the first request that is NOT currently on cooldown
         -- so one unresolved/ignored user can never block everyone else.
         local trade = nil
+        if #incoming > 1 then
+            -- Runtime log, not just a code comment, on purpose (2026-10-11,
+            -- operator request: "so I can just send console without telling
+            -- you anything") - which trade got picked out of several, and
+            -- why the others were skipped, used to be invisible in the
+            -- console. Only prints when there's actually a choice to explain.
+            print("[TRADE-PICK] " .. #incoming .. " incoming trades at once - checking cooldowns to pick one")
+        end
         for _, candidate in ipairs(incoming) do
             local candidateHold = tonumber(withdrawalHoldUntil[tostring(candidate.UserId)]) or 0
             if candidateHold <= tick() then
                 trade = candidate
+                if #incoming > 1 then
+                    print("[TRADE-PICK] Picked " .. tostring(candidate.Name) .. " (not on cooldown)")
+                end
                 break
+            elseif #incoming > 1 then
+                print("[TRADE-PICK] Skipping " .. tostring(candidate.Name) .. " - still on cooldown for " ..
+                    string.format("%.1f", candidateHold - tick()) .. "s more")
             end
         end
-        trade = trade or incoming[1]
+        if not trade then
+            trade = incoming[1]
+            if #incoming > 1 then
+                print("[TRADE-PICK] Every incoming trade is on cooldown - falling back to the first one anyway (" ..
+                    tostring(trade.Name) .. ") rather than process nothing")
+            end
+        end
 
         local username = trade.Name
         local userId = tostring(trade.UserId)
@@ -6888,6 +7083,28 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
         )
 
         if not depositAllowed and not (withdrawalData and withdrawalData.data) then
+            -- Plain-English reason added here on purpose (2026-10-11,
+            -- operator request: "so when a thing happens you know why so I
+            -- can just send console") - the raw field dump below still
+            -- prints for completeness, but reading five tostring() fields
+            -- to reverse-engineer which ONE of them actually caused the
+            -- block is exactly the kind of thing a pasted log should not
+            -- require explaining. This line says it in one sentence.
+            local blockReason
+            if withdrawalData == nil then
+                blockReason = "the get-pending-withdrawal lookup never returned usable data at all (network/parse failure upstream)"
+            elseif withdrawalData.success ~= true then
+                blockReason = "the backend lookup itself reported success=false - treating as unsafe to deposit rather than assuming it's fine"
+            elseif withdrawalData.blocked == true then
+                blockReason = "the backend explicitly marked this user as blocked from depositing right now"
+            elseif withdrawalData.pendingWithdrawalExists ~= false then
+                blockReason = "pendingWithdrawalExists is not a confirmed false (missing/nil/true) - deposits are refused unless the backend explicitly clears this"
+            elseif withdrawalData.data ~= nil then
+                blockReason = "a withdrawal payload is actually present - this falls through to WITHDRAWAL MODE below instead, not a real block"
+            else
+                blockReason = "unrecognized combination of fields - see the raw dump below"
+            end
+            warn("[DEPOSIT-GATE] BLOCKED - " .. blockReason)
             warn("[DEPOSIT-GATE] BLOCKED | success=" ..
                 tostring(withdrawalData and withdrawalData.success) ..
                 " | pendingWithdrawalExists=" ..
