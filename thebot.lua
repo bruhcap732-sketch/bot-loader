@@ -1394,40 +1394,94 @@ end
 -- later deposit of the same pet name.
 -- ============================================================
 local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of this pet's own catalog value
+-- Copied verbatim from the proven thebot.lua (2026-10-11, operator
+-- request: "copy the hovering thing") - this version ACTUALLY FORCES the
+-- hover (moves the real cursor to the item slot + fires MouseEnter) before
+-- reading the tooltip. The earlier version in this file only checked
+-- whether InfoOverlay happened to already be populated, which it almost
+-- never is without a real hover triggering it - that's why Cosmic Value
+-- was effectively never read here. CV_INTER_ITEM_SETTLE_SECONDS gives
+-- PS99's own tooltip handler a moment to close out after the PREVIOUS
+-- item's hover before starting this one's, since a real cursor move
+-- happening too fast after the last one can leave the tooltip stuck.
+local CV_INTER_ITEM_SETTLE_SECONDS = 0.12
 
-local function readCosmicValue(petName, referenceValue)
-    if cvCache[petName] then return cvCache[petName] end
-
+local function readCosmicValue(itemSlot, displayName, referenceValue)
+    if cvCache[displayName] then return cvCache[displayName] end
     local refNum = tonumber(referenceValue)
+    task.wait(CV_INTER_ITEM_SETTLE_SECONDS)
 
+    local fire = getgenv and getgenv().firesignal or firesignal
+    local moveMouse = (getgenv and (getgenv().mousemoveabs or getgenv().MouseMoveAbs))
+        or mousemoveabs or MouseMoveAbs
+
+    if type(fire) ~= "function" and type(moveMouse) ~= "function" then
+        warn("[CV] Neither firesignal() nor mousemoveabs() is available in this executor - Cosmic Value cannot be read")
+        return nil
+    end
+
+    local seenTitles = {}
+    local allTextsSeen = {}
+    local overlayFoundCount = 0
     for attempt = 1, 4 do
+        print("[CV] Attempting read for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
+
+        if type(moveMouse) == "function" then
+            local ok = pcall(function()
+                local inset = game:GetService("GuiService"):GetGuiInset()
+                local pos = itemSlot.AbsolutePosition
+                local size = itemSlot.AbsoluteSize
+                local x = pos.X + size.X / 2 + inset.X
+                local y = pos.Y + size.Y / 2 + inset.Y
+                moveMouse(x, y)
+            end)
+            if not ok then
+                warn("[CV] mousemoveabs failed for " .. tostring(displayName))
+            end
+        elseif attempt == 1 then
+            warn("[CV] mousemoveabs() not available in this executor - relying on firesignal alone, which is known not to reliably populate the tooltip by itself")
+        end
+
+        if type(fire) == "function" then
+            local ok, fireErr = pcall(function()
+                fire(itemSlot.MouseMoved, 0, 0)
+                fire(itemSlot.MouseEnter, 0, 0)
+            end)
+            if not ok then
+                warn("[CV] firesignal(MouseEnter) threw for " .. tostring(displayName) .. ": " .. tostring(fireErr))
+            end
+        end
+
+        task.wait(0.12)
+
         local overlay = playerGUI:FindFirstChild("InfoOverlay")
         if not overlay then
-            if attempt < 4 then task.wait(0.1) end
+            warn("[CV] InfoOverlay not found in PlayerGui for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
         else
+            overlayFoundCount = overlayFoundCount + 1
             local cvValue, demand, rejectedLow = nil, nil, nil
 
             for _, v in ipairs(overlay:GetDescendants()) do
                 pcall(function()
                     if not (v:IsA("TextLabel") or v:IsA("TextButton")) then return end
                     local t = tostring(v.Text or "")
-                    if v.Name == "title" and t ~= "" and t ~= "..." then
-                        -- CV line matches pattern like "11.5m (7/10)"
-                        if t:find("%(") and t:find("/10%)") then
-                            local raw = t:match("^([%d%.]+[kmbt]?)")
-                            local dem = t:match("%((%d+)/10%)")
-                            if raw and not cvValue then
-                                local num = tonumber(raw:match("^([%d%.]+)")) or 0
-                                local suffix = (raw:match("[kmbt]$") or ""):lower()
-                                local mult = {k=1e3, m=1e6, b=1e9, t=1e12}
-                                local parsed = math.floor(num * (mult[suffix] or 1))
-
-                                if refNum and refNum > 0 and parsed < refNum * CV_PLAUSIBILITY_FLOOR then
-                                    rejectedLow = { parsed = parsed, refNum = refNum }
-                                else
-                                    cvValue = parsed
-                                    demand = tonumber(dem)
-                                end
+                    if t ~= "" and t ~= "..." and #allTextsSeen < 15 then
+                        table.insert(allTextsSeen, v.Name .. "=\"" .. t .. "\"")
+                    end
+                    if t ~= "" and t ~= "..." and t:find("%(") and t:find("/10%)") then
+                        if #seenTitles < 5 then table.insert(seenTitles, v.Name .. "=" .. t) end
+                        local raw = t:match("^([%d%.]+[kmbt]?)")
+                        local dem = t:match("%((%d+)/10%)")
+                        if raw and not cvValue then
+                            local num = tonumber(raw:match("^([%d%.]+)")) or 0
+                            local suffix = (raw:match("[kmbt]$") or ""):lower()
+                            local mult = { k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
+                            local parsed = math.floor(num * (mult[suffix] or 1))
+                            if refNum and refNum > 0 and parsed < refNum * CV_PLAUSIBILITY_FLOOR then
+                                rejectedLow = { parsed = parsed, refNum = refNum }
+                            else
+                                cvValue = parsed
+                                demand = tonumber(dem)
                             end
                         end
                     end
@@ -1435,22 +1489,42 @@ local function readCosmicValue(petName, referenceValue)
             end
 
             if cvValue then
+                if type(fire) == "function" then
+                    pcall(function() fire(itemSlot.MouseLeave, 0, 0) end)
+                end
+
                 local result = { value = cvValue, demand = demand }
-                cvCache[petName] = result
-                print("[CV] " .. tostring(petName) .. " = " .. tostring(cvValue) .. " demand=" .. tostring(demand) .. " (attempt " .. attempt .. "/4)")
+                cvCache[displayName] = result
+                print("[CV] " .. tostring(displayName) .. " = " .. tostring(cvValue) .. " demand=" .. tostring(demand) .. " (attempt " .. attempt .. "/4)")
                 return result
             end
 
             if rejectedLow then
-                warn("[CV-REJECT] " .. tostring(petName) .. ": read " .. tostring(rejectedLow.parsed) ..
+                warn("[CV-REJECT] " .. tostring(displayName) .. ": read " .. tostring(rejectedLow.parsed) ..
                     " but catalog value is " .. tostring(rejectedLow.refNum) .. " - refusing as implausible (attempt " .. attempt .. "/4)")
             end
+        end
 
-            if attempt < 4 then task.wait(0.1) end
+        if attempt < 4 then
+            task.wait(0.05)
         end
     end
 
-    warn("[CV-FAIL] " .. tostring(petName) .. ": no usable Cosmic Value read after 4 attempts")
+    if type(fire) == "function" then
+        pcall(function() fire(itemSlot.MouseLeave, 0, 0) end)
+    end
+
+    if overlayFoundCount == 0 then
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay never appeared in PlayerGui on any of 4 attempts - the hover/tooltip trigger itself isn't opening it.")
+    elseif #seenTitles > 0 then
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) and had CV-shaped text, but every match got rejected as implausible or none parsed cleanly. Matches seen: " ..
+            table.concat(seenTitles, " | "))
+    elseif #allTextsSeen > 0 then
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but nothing inside matched the Cosmic Value shape at all. All text actually found inside: " .. table.concat(allTextsSeen, " | "))
+    else
+        warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but was completely empty of text.")
+    end
+
     return nil
 end
 
@@ -1495,7 +1569,7 @@ local function checkTheirItems()
         end)
         local str = (shiny and "Shiny " or "") .. (rarity ~= "Normal" and (rarity .. " ") or "") .. name
         if table.find(supporteditems, str) then
-            local cv = readCosmicValue(str)
+            local cv = readCosmicValue(item, str, nil)
             table.insert(foundItems, {
                 name = str,
                 cosmicValue = cv and cv.value or nil,
@@ -2098,7 +2172,7 @@ local function checkItems(isWithdrawal)
 
             local cosmicValue, demand = nil, nil
             if isAcceptedTier then
-                local cv = readCosmicValue(displayName, entry and entry.value)
+                local cv = readCosmicValue(item, displayName, entry and entry.value)
                 if cv then
                     cosmicValue = cv.value
                     demand = cv.demand
