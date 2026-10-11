@@ -1166,6 +1166,85 @@ local function sendMessage(message)
     task.spawn(sendCriticalMessage, message)
 end
 
+-- Operator request (2026-10-10): "add multiple blockers... tell it in the
+-- console... so when I give you my console it tells you exactly why it
+-- broke." Console-only (print), never chat (sendMessage/sendCriticalMessage)
+-- - the player never sees these. A single consistent, greppable [STEP n]
+-- marker at every major checkpoint of the deposit/completion chain, so a
+-- pasted console log makes it immediately obvious exactly how far a trade
+-- got before it stopped, instead of inferring it from scattered differently-
+-- tagged lines. Numbers are fixed/sequential for the deposit path
+-- specifically (the one that's been failing) - seeing [STEP 5] but never
+-- [STEP 6] means the break is between those two exact points, full stop.
+local function logStep(n, desc)
+    print("[STEP " .. tostring(n) .. "] " .. tostring(desc))
+end
+
+-- Operator request (2026-10-10): "add more things... the console tells you
+-- exactly why it broke." One real gap the STEP markers above can't cover:
+-- if this script ever hits an actual Lua runtime error mid-trade (a nil
+-- value, anything unanticipated), a plain task.spawn just silently kills
+-- that one coroutine - Roblox prints a generic stack trace with none of
+-- this file's own tagging, easy to miss or not recognize as the actual
+-- cause of a trade mid-sequence. A trade that dies this way would show its
+-- last real [STEP] line and then just... stop, identical on the surface to
+-- every other "it broke here" case, except there would be no FAIL marker
+-- explaining why - because nothing after the crash point ever got a
+-- chance to run, including any warn()/logStep("X-FAIL", ...) call that
+-- failure path was supposed to have.
+--
+-- safeSpawn wraps task.spawn in xpcall with a full traceback, tagged
+-- [FATAL] so it's unmistakable and greppable the same way every other
+-- checkpoint is. Used for every trade-critical coroutine below
+-- (connectStatus, connectConfirm, the main trade loop) - the ones where a
+-- crash would otherwise look identical to "the trade just silently
+-- stopped" with no explanation anywhere.
+local function safeSpawn(label, fn)
+    task.spawn(function(...)
+        local ok, err = xpcall(fn, function(e)
+            return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+        end, ...)
+        if not ok then
+            warn("[FATAL] Uncaught error in " .. tostring(label) .. ": " .. tostring(err))
+        end
+    end)
+end
+
+-- Same idea as safeSpawn, but for the MAIN TRADE LOOP specifically - that
+-- one is a `while true do` that's supposed to run for the bot's entire
+-- life. A plain task.spawn there means a single uncaught error in ANY
+-- iteration kills the whole coroutine permanently - the bot would stop
+-- accepting every future trade for the rest of the session, completely
+-- silently (nothing watching it, nothing restarting it), the single worst
+-- possible failure mode this script has. This restarts the loop function
+-- itself after logging a clear [FATAL], with a short delay so a
+-- deterministic/immediate crash can't spin the CPU in a tight restart
+-- loop - the bot keeps trying to work instead of just going dark forever.
+-- onCrash: optional cleanup run after a crash, before restarting - without
+-- it, a crash mid-trade would restart the loop with the trade-lock state
+-- (goNext, activeIncomingTrade) exactly as the crash left it, which for the
+-- main loop specifically (gated on `if not goNext then continue end`)
+-- would restart into a loop that spins forever doing nothing instead of
+-- actually recovering.
+local function safeSpawnLoop(label, fn, onCrash)
+    local function run()
+        local ok, err = xpcall(fn, function(e)
+            return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+        end)
+        warn("[FATAL] " .. tostring(label) .. " crashed and stopped: " .. tostring(err))
+        if onCrash then
+            local cleanupOk, cleanupErr = pcall(onCrash)
+            if not cleanupOk then
+                warn("[FATAL] " .. tostring(label) .. " crash-cleanup itself failed: " .. tostring(cleanupErr))
+            end
+        end
+        warn("[FATAL] Restarting " .. tostring(label) .. " in 2 seconds...")
+        task.wait(2)
+        task.spawn(run)
+    end
+    task.spawn(run)
+end
+
 local function sendDiscord(message, color)
     pcall(function()
         request({
@@ -4195,7 +4274,9 @@ local function handleTradeCompletion(tradeMethod)
         if not lastTradeUsername or lastTradeUsername == "" then return end
         if #lastTradeItems == 0 and lastTradeGems == 0 then return end
         print("[COMPLETE] Processing deposit: " .. #lastTradeItems .. " pets, " .. lastTradeGems .. " gems (bypassMin=" .. tostring(bypassMin) .. ")")
+        logStep(8, "Calling process-deposit API now")
         local success, result = processDeposit(lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, bypassMin)
+        logStep(9, "process-deposit API responded | success=" .. tostring(success) .. " | result=" .. tostring(result))
         if success then
             -- Operator report (2026-10-01): "make the bot stop typing in
             -- the chat" - traced to Roblox's own anti-link filter turning
@@ -4226,7 +4307,20 @@ local function handleTradeCompletion(tradeMethod)
             -- own doc comment. This is the exact failure mode that used to
             -- be completely invisible: the trade already succeeded in
             -- Roblox, the pet is gone, and the site never credited it.
-            sendCriticalMessage("⚠️ Deposit error - your items may not have been credited. Screenshot this and contact support: " .. tostring(result))
+            -- Real bug fix (2026-10-10, live operator report: "it has to
+            -- play one more last message and it doesn't play it... when it
+            -- works it says like warning... contact support... but I don't
+            -- know"). The emoji on this message is almost certainly why -
+            -- Roblox's chat filter can reject an ENTIRE message over a
+            -- single character it doesn't like, especially on an account
+            -- without full chat/ID verification, rendering the whole thing
+            -- as a wall of #/filtered symbols instead of the real text -
+            -- exactly what showed up in the operator's own screenshot,
+            -- right where this exact warning should have appeared. This is
+            -- the one message telling the player their deposit may have
+            -- silently failed - it cannot afford to be the one message that
+            -- gets eaten by the filter. Plain ASCII only.
+            sendCriticalMessage("WARNING: Deposit error - your items may not have been credited. Screenshot this and contact support: " .. tostring(result))
             sendDiscord("DEPOSIT FAILED: " .. lastTradeUsername .. " | " .. tostring(result), 16711680)
         end
     end
@@ -4388,6 +4482,7 @@ local function handleTradeCompletion(tradeMethod)
             local confirmationMissingGems = tonumber(lastWithdrawalMissing.gems) or 0
             local confirmationSentGems = tonumber(gemsActuallySent) or 0
 
+            logStep("W4", "Calling complete-withdrawal API now")
             local confirmed, confirmError = confirmWithdrawal(
                 confirmationUserId,
                 confirmationWithdrawal,
@@ -4397,6 +4492,7 @@ local function handleTradeCompletion(tradeMethod)
                 confirmationMissingGems,
                 confirmationSentGems
             )
+            logStep("W5", "complete-withdrawal API responded | confirmed=" .. tostring(confirmed) .. " | error=" .. tostring(confirmError))
 
             -- If Roblox already reported SUCCESS, the assets have already moved.
             -- Do not make the user remain in an apparently pending state just because
@@ -4507,7 +4603,8 @@ local function handleTradeCompletion(tradeMethod)
                 -- confirmed's own if-check), but the player should know
                 -- immediately rather than finding out only if it keeps
                 -- failing.
-                sendCriticalMessage("⚠️ Withdrawal sent but confirm had issues - contact support if balance looks wrong")
+                -- Same emoji-filter fix as the deposit-error message above.
+                sendCriticalMessage("WARNING: Withdrawal sent but confirm had issues - contact support if balance looks wrong")
                 sendDiscord("**WITHDRAWAL (confirm issue)**\n**Player:** " .. tostring(lastTradeUsername) ..
                     "\n**Pets sent:** " .. petCount .. "\n**Gems sent:** " .. gemsActuallySent ..
                     (isPartial and ("\n**PARTIAL**" .. missingStr) or "") ..
@@ -4540,7 +4637,7 @@ end
 -- via lastItemsGiven/checkBotTradeItems at trade completion.
 -- ============================================================
 local function connectConfirm(localId, tradeMethod, validatedItems, validatedGems)
-    task.spawn(function()
+    safeSpawn("connectConfirm", function()
         -- The player has already readied. Use a short synchronization window
         -- instead of a fixed 3-second wait.
         -- Fast path: the ready event already tells us the player is ready.
@@ -4561,6 +4658,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         -- check further down already catches). See client_trade_gems's own
         -- doc comment for what counts as a real failure vs. an honest 0.
         if not confirmGemsReadOk then
+            logStep("4-FAIL", "Declining at confirm stage - gems unreadable right before confirming")
             warn("[GEMS-GATE] Declining at confirm stage - could not read gems offered in this trade")
             sendMessage("Could not confirm the gems in this trade - cancelling for safety. Please re-trade.")
             sendDiscord("⚠️ **GEMS-GATE (confirm stage)**\n**Player:** " .. tostring(lastTradeUsername) ..
@@ -4611,6 +4709,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         end
 
         if swapped then
+            logStep("4-FAIL", "Declining at confirm stage - items/gems changed since ready (swap check failed)")
             sendMessage("Trade items changed after ready - cancelling!")
             sendDiscord("🚨 **POSSIBLE SWAP ATTACK**\n**Player:** " .. tostring(lastTradeUsername) ..
                 "\n**Method:** " .. tradeMethod ..
@@ -4654,6 +4753,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             end
         end
         if missingCosmicAtConfirm then
+            logStep("4-FAIL", "Declining at confirm stage - no Cosmic Value for " .. tostring(missingCosmicAtConfirm))
             warn("[CV-GATE] Declining at confirm stage - no Cosmic Value read for " .. tostring(missingCosmicAtConfirm))
             sendMessage("Could not confirm Cosmic Value for " .. tostring(missingCosmicAtConfirm) .. " - cancelling for safety. Please re-trade.")
             sendDiscord("⚠️ **CV-GATE (confirm stage)**\n**Player:** " .. tostring(lastTradeUsername) ..
@@ -4676,6 +4776,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         lastTradeItems = confirmItems
         lastTradeGems  = confirmGems
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
+        logStep(4, "Player CONFIRMED and verified - bot about to send its own SetConfirmed")
 
         -- Real bug fix (2026-10-10, live operator report: both sides showed
         -- "Confirmed!" with PS99's own countdown running on a real 701M-value
@@ -4734,6 +4835,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
 
         if confirmed then
             botConfirmed = true
+            logStep(5, "Bot CONFIRMED - verified via GetState. Now waiting for PS99's own completion message.")
             sendMessage("Trade confirmed!")
             print("[CONFIRM] Confirmed via GetState")
         else
@@ -4742,6 +4844,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             -- same as before, but this is now a true last resort instead of
             -- the default outcome of any minor timing hiccup.
             warn("[CONFIRM] Could not verify via GetState after 4 attempts - marking confirmed anyway")
+            logStep(5, "Bot confirm UNVERIFIED after 4 attempts - proceeding anyway. Now waiting for PS99's own completion message.")
             botConfirmed = true
             sendMessage("Trade confirmed!")
         end
@@ -4755,7 +4858,7 @@ end
 -- is debounced so the same READY cycle cannot trigger duplicate validation.
 -- ============================================================
 local function connectStatus(localId, tradeMethod)
-    task.spawn(function()
+    safeSpawn("connectStatus", function()
         local startTime    = tick()
         local wasReady     = false
         local confirmFired = false
@@ -4906,6 +5009,7 @@ local function connectStatus(localId, tradeMethod)
                         lastTradeItems = output
                         lastTradeGems  = depositGems
                         hasReadied     = true
+                            logStep(2, "Items VALIDATED (" .. #lastTradeItems .. " pets + " .. depositGems .. " gems) - bot about to ready")
                             sendMessage("Validated: " .. #lastTradeItems .. " pets + " .. formatDepositGemCredit(depositGems))
 
                             local readied = false
@@ -4918,6 +5022,7 @@ local function connectStatus(localId, tradeMethod)
                             end
 
                             if not readied then
+                                logStep("2-FAIL", "Bot could NOT ready after items validated - SetReady never verified across 3 attempts")
                                 warn("[READY] Bot could not send SetReady(true) after 3 attempts")
                                 sendMessage("Bot could not ready the trade. Please re-open the trade and try again.")
                                 pcall(function() tradingCommands.SetReady(false) end)
@@ -4937,6 +5042,7 @@ local function connectStatus(localId, tradeMethod)
                                 -- isn't being abandoned, just no longer exclusive.
                                 releaseIncomingTradeLock()
                             else
+                                logStep(3, "Bot READIED successfully - waiting for player to click confirm")
                                 sendMessage("Bot READY - click confirm!")
                                 confirmFired = true
                                 validationRunning = false
@@ -5190,16 +5296,42 @@ local function connectMessage(localId, tradeMethod)
         end
 
         print("[MSG] '" .. text .. "'")
+        logStep(6, "Message popup fired, raw text: '" .. text .. "'")
         local low = text:lower()
 
         -- ✅ ONLY process the trade if PS99 explicitly confirms success
         if low:find("success") or low:find("complet") then
             msgConn:Disconnect()
+            logStep(7, "SUCCESS text matched - calling handleTradeCompletion")
             print("[MSG] SUCCESS message confirmed - processing trade")
-            handleTradeCompletion(tradeMethod)
+            -- The single most critical call in the whole script - this is
+            -- what actually credits a deposit or confirms a withdrawal. If
+            -- it ever throws partway through (a real Lua bug, not a
+            -- network failure - those are already pcall'd deeper inside),
+            -- the old plain call would let it die with just a generic
+            -- Roblox error, no [FATAL] tag, easy to miss in a long log.
+            local ok, err = xpcall(handleTradeCompletion, function(e)
+                return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+            end, tradeMethod)
+            if not ok then
+                warn("[FATAL] handleTradeCompletion crashed: " .. tostring(err))
+                -- Don't wait on the 90s TRADE-WATCHDOG to notice - a crash here
+                -- can leave tradeProcessed=true (set at the very top of that
+                -- function) but never reach its own cleanup at the bottom, which
+                -- would otherwise block every future trade until the watchdog's
+                -- hard reset. Force it immediately instead.
+                sendMessage("Something went wrong processing this trade - please contact support with a screenshot of this chat.")
+                goNext = true
+                tradeId = 0
+                lastGameTradeId = nil
+                method = nil
+                releaseIncomingTradeLock()
+                resetTradeState()
+            end
             pcall(function() tradingMessage.Enabled = false end)
 
         elseif low:find("cancel") or low:find("left") or low:find("decline") then
+            logStep("6-CANCEL", "Message matched as a CANCEL, not success - trade did not complete")
             msgConn:Disconnect()
             tradeCancelled = true
             tradeProcessed = true
@@ -5949,13 +6081,14 @@ end)
 -- ============================================================
 -- MAIN TRADE LOOP
 -- ============================================================
-task.spawn(function()
+safeSpawnLoop("MAIN TRADE LOOP", function()
     while true do
         if type(tradingCommands) ~= "table" then
             warn("[BOT] TradingCommands unavailable - waiting...")
             task.wait(5)
             continue
         end
+
 
         task.wait(0.05)
 
@@ -6357,6 +6490,7 @@ task.spawn(function()
     lastGameTradeId = localId
 
     if localId then
+        logStep("W1", "Withdrawal trade ACCEPTED - bot about to add items | user=" .. username)
         sendMessage("== WITHDRAWAL MODE ==")
         sendMessage("Bot is sending you your items.")
         sendDiscord("Withdrawal started: " .. username, 16776960)
@@ -6437,6 +6571,7 @@ task.spawn(function()
         -- NOTHING COULD BE ADDED
         -- ====================================================
         if not fullyAdded then
+            logStep("W2-FAIL", "Could not add items to withdrawal trade: " .. tostring(addErr))
             warn(
                 "[WITHDRAWAL] Could not prepare withdrawal: " ..
                 tostring(addErr)
@@ -6522,6 +6657,7 @@ task.spawn(function()
         print(
             "[WITHDRAWAL] Everything available has been added."
         )
+        logStep("W2", "Items ADDED to trade (" .. #itemsGiven .. " pets + " .. gemsGiven .. " gems) - bot about to ready")
 
         print(
             "[WITHDRAWAL] Bot is READYING immediately..."
@@ -6554,6 +6690,7 @@ task.spawn(function()
         -- READY FAILED
         -- ====================================================
         if not readyOk then
+            logStep("W3-FAIL", "Bot could NOT ready after items were added - SetReady never verified across 3 attempts")
             warn(
                 "[WITHDRAWAL] Bot could not READY after adding items"
             )
@@ -6587,6 +6724,7 @@ task.spawn(function()
         -- ====================================================
         -- BOT IS NOW READY
         -- ====================================================
+        logStep("W3", "Bot READIED for withdrawal - waiting for player to confirm")
         sendMessage(
             "Bot READY - click confirm!"
         )
@@ -6718,6 +6856,7 @@ task.spawn(function()
             lastGameTradeId = localId
 
             if localId then
+                logStep(1, "Deposit trade ACCEPTED - bot waiting for player to add items + ready | user=" .. username)
                 sendMessage("Add pets/gems then click READY")
 
                 sendDiscord(
@@ -6796,6 +6935,18 @@ task.spawn(function()
             end
         end
     end
+end, function()
+    -- Runs once after a crash, before the loop restarts - see
+    -- safeSpawnLoop's own doc comment for why this is necessary here
+    -- specifically (without it, a crash mid-trade would restart into a
+    -- permanently stuck goNext=false state instead of actually recovering).
+    warn("[FATAL] MAIN TRADE LOOP crash cleanup - forcing trade state back to idle")
+    goNext = true
+    tradeId = 0
+    lastGameTradeId = nil
+    method = nil
+    releaseIncomingTradeLock()
+    resetTradeState()
 end)
 
 print("[BOT] BloxyFlip Bot RUNNING!")
