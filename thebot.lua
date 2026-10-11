@@ -6177,9 +6177,13 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
             local lastDecline = tonumber(lastHoldDeclineAt[userId]) or 0
             if tick() - lastDecline >= 1 then
                 lastHoldDeclineAt[userId] = tick()
-                print("[TRADE] Ignoring repeated blocked-withdrawal request | user=" ..
-                    tostring(username) .. " | cooldown=" ..
-                    string.format("%.1fs", holdUntil - tick()))
+                -- Operator request (2026-10-11): "can you remove that thing,
+                -- where it says retrying" - this used to print a console
+                -- line every ~1s for as long as a blocked/unlinked account
+                -- kept its trade window open, which could spam dozens of
+                -- identical lines in a row and bury real signal in the
+                -- console. The actual decline below is unchanged - this
+                -- only removes the repeated print, not the behavior.
                 pcall(function()
                     if type(tradingCommands.DeclineRequest) == "function" then
                         tradingCommands.DeclineRequest(trade)
@@ -6420,7 +6424,25 @@ safeSpawnLoop("MAIN TRADE LOOP", function()
                 end
             end)
 
-            sendMessage("BloxyFlip could not verify your withdrawal status. Please try again.")
+            -- Real bug fix (2026-10-11, operator question: "why do you
+            -- think it's [stopping] people [who] want to sign up"): this
+            -- branch fires for ANY unresolved lookup, but by far the most
+            -- common real cause is a brand new player who has never linked
+            -- a BloxyFlip account at all (check-user-banned returns
+            -- found=false). They used to get "could not verify your
+            -- withdrawal status. Please try again." - wrong (they're not
+            -- even trying to withdraw) and useless ("try again" repeats the
+            -- exact same failure forever, since nothing about retrying the
+            -- same trade links an account). A first-time depositor's very
+            -- first interaction with the bot was a confusing dead end with
+            -- no path forward - a real, plausible reason someone bounces
+            -- instead of signing up. Now tells them the one thing that
+            -- actually fixes it.
+            if userInfo and userInfo.found == false then
+                sendMessage("Link your Roblox account at bloxyflip.fun first, then trade again!")
+            else
+                sendMessage("BloxyFlip could not verify your account. Please try again.")
+            end
 
             -- Real bug (operator report, 2026-09-19): this branch fires for
             -- ANY unresolved lookup - most commonly a Roblox account with no
