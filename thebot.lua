@@ -4796,11 +4796,25 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         -- ACTUAL Roblox trade was still waiting on a confirm that was never
         -- really sent - explaining a trade that visually shows "Confirmed!"
         -- (the player's own local UI optimism) but never actually completes.
-        -- Now: up to 4 real attempts, each with its own SetConfirmed call (in
-        -- case the first one simply never reached the server) and a genuine
-        -- polling window to let it land, before ever falling back to the
-        -- old "proceed anyway" behavior - which now only fires as a true last
-        -- resort, not on the very first unlucky frame.
+        -- REVERTED (2026-10-10, live operator comparison against a known-
+        -- working older copy of this script): the 4x-retry version above
+        -- was itself the regression, not a fix. The working version of this
+        -- script calls SetConfirmed(true) EXACTLY ONCE and moves on - this
+        -- version was re-sending it up to 4 separate times whenever
+        -- GetState's read didn't immediately confirm. The working theory:
+        -- PS99's server does not expect to be told "I confirm" more than
+        -- once for the same trade - a second/third SetConfirmed(true) call,
+        -- sent while the FIRST one may have already landed and was simply
+        -- slow to reflect in GetState (a known flaky read elsewhere in this
+        -- file - see readyTrade/addPet's own comments on the same lag),
+        -- could look to the game like the confirmation being reset and
+        -- re-sent, which would explain exactly what was observed: the
+        -- trade visually shows "Confirmed!" but the real completion
+        -- message from PS99 never arrives. Back to a single send, still
+        -- polling (read-only, no repeated commands) for up to 0.5s to see
+        -- whether it landed, purely for the STEP 5 log line below - never
+        -- calling SetConfirmed a second time regardless of what that read
+        -- shows.
         local confirmed = false
         local myId = tostring(localPlayer.UserId)
 
@@ -4816,21 +4830,13 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             return false
         end
 
-        for attempt = 1, 4 do
-            if attempt > 1 then
-                print("[CONFIRM] Retry attempt " .. attempt .. "/4 - re-sending SetConfirmed(true)")
+        pcall(function() tradingCommands.SetConfirmed(true) end)
+        for _ = 1, 10 do
+            task.wait(0.05)
+            if isConfirmedNow() then
+                confirmed = true
+                break
             end
-            pcall(function() tradingCommands.SetConfirmed(true) end)
-
-            for _ = 1, 10 do
-                task.wait(0.05)
-                if isConfirmedNow() then
-                    confirmed = true
-                    break
-                end
-            end
-
-            if confirmed then break end
         end
 
         if confirmed then
