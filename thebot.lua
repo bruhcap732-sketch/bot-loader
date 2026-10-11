@@ -963,7 +963,21 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
         lastData = data
         lastStatus = status
 
-        if s and r and status == 200 and data and data.success then
+        -- REAL BUG FOUND (2026-10-10, live operator log): the backend's
+        -- /process-deposit route returns HTTP 201 (Created) for every
+        -- normal, genuinely new deposit, and only ever returns 200 for a
+        -- duplicate resubmission - this is standard REST practice (201 =
+        -- "a new resource was created"), but this check only ever accepted
+        -- 200. That means EVERY real first-time deposit was being treated
+        -- as a FAILURE by this script, even while the backend's own
+        -- response said {"success":true,"status":"CREDITED"} - confirmed
+        -- directly from a live log: [API] showed 201 CREDITED, and the verf
+        -- next line showed this function returning false with
+        -- result="HTTP 201". The deposit genuinely succeeded the entire
+        -- time; the bot just told itself (and the player, via the
+        -- WARNING/contact-support message) that it hadn't. This is very
+        -- likely the single biggest explanation for tonight's whole saga.
+        if s and r and (status == 200 or status == 201) and data and data.success then
             local dep = data.deposit or {}
             return true, dep.value or 0, data
         end
@@ -5213,15 +5227,41 @@ local function connectStatus(localId, tradeMethod)
                         print("[STATUS] Trade already completed during grace period - skipping cancel")
                         return
                     end
-                    warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
-                    sendMessage("Trade items changed - cancelling for safety!")
-                    tradeCancelled = true
-                    tradeProcessed = true
-                    declineTrade()
-                    goNext = true
-                    releaseIncomingTradeLock()
-                    resetTradeState()
-                    return
+
+                    -- 100k-trial simulation (2026-10-10) of this exact race found a
+                    -- real gap: the grace period above only ever checked tradeProcessed/
+                    -- tradeCancelled, never isPlayerReady() itself again. A 4-tick
+                    -- "not ready" streak is only a TRANSIENT glitch, not real swap
+                    -- abuse, if the player is genuinely ready again a full second
+                    -- later - but without this re-check, a resolved glitch still got
+                    -- declined just because the stale streak had already crossed the
+                    -- threshold before it resolved. Simulated false-cancel rate on a
+                    -- genuinely good deposit ranged 14-32% once a glitch burst lasted
+                    -- 3-4 poll ticks (~45-140ms) - plausible given the GUI teardown
+                    -- this is reading through. Re-checking here costs nothing (same
+                    -- isPlayerReady() already used every other tick) and closes the
+                    -- gap regardless of how long a real glitch actually lasts.
+                    -- NOTE: deliberately does NOT `return` here, unlike the
+                    -- tradeProcessed/tradeCancelled check above - this trade is
+                    -- NOT over, it just wasn't real abuse. Returning would end
+                    -- this whole connectStatus coroutine early and stop
+                    -- monitoring the player's ready state for the rest of the
+                    -- trade. Reset the streak and let the while loop's next
+                    -- iteration carry on watching normally.
+                    if isPlayerReady() then
+                        print("[STATUS] Player is ready again after grace period - treating prior un-ready streak as a UI glitch, not cancelling")
+                        postConfirmNotReadyCount = 0
+                    else
+                        warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
+                        sendMessage("Trade items changed - cancelling for safety!")
+                        tradeCancelled = true
+                        tradeProcessed = true
+                        declineTrade()
+                        goNext = true
+                        releaseIncomingTradeLock()
+                        resetTradeState()
+                        return
+                    end
                 end
             else
                 postConfirmNotReadyCount = 0
