@@ -1219,6 +1219,12 @@ local function refreshTradeElements()
         -- failed) and closes off this entire class of failure the same way
         -- the Message fix did.
         if not frame then
+            -- Same playerGUI-itself hardening as connectMessage - see its
+            -- own doc comment (operator report: "it unbreaks when I
+            -- rejoin the game"). Re-resolve the container before
+            -- searching inside it for a fresh TradeWindow.
+            local freshGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+            if freshGui then playerGUI = freshGui end
             local freshWindow = playerGUI:FindFirstChild("TradeWindow")
             if freshWindow and freshWindow ~= tradingWindow then
                 tradingWindow = freshWindow
@@ -5145,6 +5151,21 @@ local function connectMessage(localId, tradeMethod)
     -- here, every single trade, closes that gap entirely - FindFirstChild
     -- is cheap, there's no real cost to doing this every time instead of
     -- only once.
+    -- One layer deeper (2026-10-10, operator report: "it unbreaks when I
+    -- rejoin the game" - rejoining resets EVERYTHING this script references
+    -- at once, which is consistent with more than just the Message popup
+    -- going stale over a long session). playerGUI itself - the container
+    -- everything else gets searched inside of - is also resolved exactly
+    -- once at script startup (near the top of the file) and was never
+    -- re-checked anywhere. If it ever goes stale the same way the Message
+    -- popup did, re-fetching tradingMessage through it would still search a
+    -- dead container and find nothing - this fix alone wouldn't fully
+    -- explain needing a full rejoin to recover otherwise. Re-resolving it
+    -- fresh from localPlayer right before using it, same reasoning as
+    -- tradingMessage/tradingWindow above.
+    local freshGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+    if freshGui then playerGUI = freshGui end
+
     tradingMessage = playerGUI:FindFirstChild("Message") or tradingMessage
     if not tradingMessage then
         warn("[MSG] tradingMessage not found - bot cannot detect trade completion!")
@@ -5738,6 +5759,60 @@ task.spawn(function()
                 print("[ITEMS] Periodic catalog refresh OK - " .. #supporteditems .. " entries")
             else
                 warn("[ITEMS] Periodic catalog refresh failed - keeping previous catalog")
+            end
+        end
+    end
+end)
+
+-- Defensive hardening (2026-10-10, NOT confirmed by direct log evidence the
+-- way the Message-popup bug was - this is precautionary, following the same
+-- reasoning after the operator reported "it unbreaks when I rejoin the
+-- game... I have to bounce around 24/7"). saveModule/tradingCommands - the
+-- actual game modules that EVERY trade action goes through (SetReady,
+-- SetConfirmed, SetItem, GetState, GetAllRequests, AcceptRequest, all of
+-- it) - are require()'d exactly ONCE at script startup and never checked
+-- again, same pattern as the Message popup and PlayerGui container that
+-- WERE confirmed stale. If these ever go stale the same way (the
+-- underlying ModuleScript instance gets destroyed/replaced), the symptom
+-- would be much broader than just missed completion messages - closer to
+-- "the whole bot quietly stops working" (deeply consistent with "I have to
+-- bounce around 24/7"), since literally every trade command flows through
+-- these two references. Rejoining the game forces a brand new script
+-- execution, which re-requires everything fresh - exactly the kind of fix
+-- a stale module reference would also explain. Checked every 60s (not
+-- per-trade like the GUI fixes - re-require() running a module's top-level
+-- code again carries more weight than a cheap FindFirstChild, so this is
+-- intentionally less aggressive) and ONLY acts if the actual underlying
+-- Instance has genuinely changed, not on every check.
+task.spawn(function()
+    while true do
+        task.wait(60)
+        if not activeIncomingTrade then
+            local freshSave = clientFolder:FindFirstChild("Save")
+            local freshTradingCmds = clientFolder:FindFirstChild("TradingCmds")
+
+            if freshSave and freshSave ~= saveModuleScript then
+                warn("[BOT] Save ModuleScript instance changed since startup - re-requiring")
+                saveModuleScript = freshSave
+                local fresh = tryRequireModule(saveModuleScript, "Save")
+                if fresh then
+                    saveModule = fresh
+                    print("[BOT] [OK] Save module re-loaded after instance change")
+                else
+                    warn("[BOT] Save module re-load FAILED - keeping previous reference")
+                end
+            end
+
+            if freshTradingCmds and freshTradingCmds ~= tradingCmdsScript then
+                warn("[BOT] TradingCmds ModuleScript instance changed since startup - re-requiring")
+                tradingCmdsScript = freshTradingCmds
+                local fresh = tryRequireModule(tradingCmdsScript, "TradingCmds")
+                if fresh then
+                    tradingCommands = fresh
+                    print("[BOT] [OK] TradingCmds module re-loaded after instance change")
+                else
+                    warn("[BOT] TradingCmds module re-load FAILED - keeping previous reference")
+                end
             end
         end
     end
