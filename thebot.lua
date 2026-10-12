@@ -4005,9 +4005,22 @@ end)
 -- ============================================================
 -- TRADE ID TRACKER
 -- ============================================================
+-- Operator report (2026-10-12): client crashing ~10s after execution,
+-- right after updating their executor - this loop and the main trade loop
+-- below are the two things running unconditionally, forever, from the
+-- moment the script starts, calling into executor-hooked game functions
+-- 10-20 times a SECOND each. Slowed down (0.1s -> 0.35s) as a safety
+-- margin against whatever changed in the executor's handling of these
+-- calls - still responsive enough to catch a new trade ID almost
+-- instantly, just far less aggressive.
 task.spawn(function()
-    while task.wait(0.1) do
-        tradeId = getTradeId()
+    while task.wait(0.35) do
+        local ok, err = pcall(function()
+            tradeId = getTradeId()
+        end)
+        if not ok then
+            warn("[WATCHDOG] Trade ID tracker iteration failed (continuing): " .. tostring(err))
+        end
     end
 end)
 
@@ -4054,7 +4067,15 @@ task.spawn(function()
             continue
         end
 
-        task.wait(0.05)
+        -- Operator report (2026-10-12): client crashing ~10s after
+        -- execution after an executor update - this loop calls into
+        -- tradingCommands.GetAllRequests() (via getTrades()) up to 20
+        -- times a second, forever, unconditionally, from the moment the
+        -- script starts. Slowed down (0.05s -> 0.2s, ~5x/sec) as a safety
+        -- margin - still fast enough that an incoming trade request gets
+        -- picked up almost instantly, just far less aggressive on
+        -- whatever changed in the executor's handling of these calls.
+        task.wait(0.2)
 
         if not goNext or activeIncomingTrade then
             -- Bot is busy with an active trade (deposit OR withdrawal).
