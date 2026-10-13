@@ -3816,8 +3816,16 @@ task.spawn(function()
         return nil
     end
 
-    local hoverButton = findHoverButton()
-    local hoverRemote = findHoverRemote()
+    -- Real fix (operator report, 2026-10-12): these two were full,
+    -- blocking scans of the ENTIRE PlayerGui and ReplicatedStorage trees -
+    -- for a game the size of PS99, that's tens of thousands of instances,
+    -- done eagerly at the 8-second mark regardless of whether they'd ever
+    -- actually be needed. Now lazy: only run the first time keypress
+    -- genuinely isn't available/doesn't work, which for most executors
+    -- never happens at all, so most sessions never pay this cost.
+    local hoverButton = nil
+    local hoverRemote = nil
+    local hoverLookupDone = false
 
     while true do
         task.wait(15)
@@ -3841,6 +3849,12 @@ task.spawn(function()
                 print("[ANTI-AFK] Q toggled via executor keypress")
                 toggled = true
             end)
+        end
+
+        if not toggled and not hoverLookupDone then
+            hoverLookupDone = true
+            hoverButton = findHoverButton()
+            hoverRemote = findHoverRemote()
         end
 
         if not toggled and hoverButton then
@@ -3870,9 +3884,13 @@ task.spawn(function()
         end
 
         if not toggled then
-            if not hoverButton then hoverButton = findHoverButton() end
-            if not hoverRemote then hoverRemote = findHoverRemote() end
-            warn("[ANTI-AFK] No toggle method worked this cycle - check remote dump above")
+            -- Real fix (operator report, 2026-10-12): this used to re-run
+            -- BOTH full-tree scans again every single 15-second cycle
+            -- forever whenever nothing worked - the same expensive
+            -- PlayerGui/ReplicatedStorage walk repeating indefinitely
+            -- instead of the one-time lazy lookup above. No retry here
+            -- any more; the single lookup already ran this session.
+            warn("[ANTI-AFK] No toggle method worked this cycle")
         end
 
         pcall(function()
