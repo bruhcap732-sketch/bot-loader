@@ -1406,6 +1406,45 @@ local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of this pe
 -- happening too fast after the last one can leave the tooltip stuck.
 local CV_INTER_ITEM_SETTLE_SECONDS = 0.12
 
+-- Operator report (2026-10-13): mousemoveabs on this (Windows) executor
+-- really does move the real OS-level cursor - confirmed live by the
+-- operator ("if I go out of the Windows Roblox, it can't detect cosmic").
+-- PS99's own hover handling apparently only reacts to a real, focused
+-- window's input, so the moment the window isn't focused, the fake OS
+-- mouse move does nothing inside the game and the tooltip never opens.
+-- getDirectHoverInvoker bypasses the OS/input layer completely: instead
+-- of asking Roblox's engine to dispatch a MouseEnter/MouseMoved event (via
+-- a real OR fake mouse), it grabs the actual Lua function(s) PS99 already
+-- connected to those signals (via getconnections, standard on most
+-- executors) and calls them directly in the Lua VM. That call has nothing
+-- to do with window focus, OS input, or what's on screen - it works
+-- exactly the same minimized, alt-tabbed, or focused.
+local function tryDirectInvoke(signal, x, y)
+    local getConns = getgenv and (getgenv().getconnections or getgenv().get_signal_cons)
+        or getconnections or get_signal_cons
+    if type(getConns) ~= "function" then return false end
+
+    local ok, conns = pcall(getConns, signal)
+    if not ok or type(conns) ~= "table" then return false end
+
+    local invokedAny = false
+    for _, conn in ipairs(conns) do
+        pcall(function()
+            if type(conn.Fire) == "function" then
+                conn:Fire(x, y)
+                invokedAny = true
+            elseif type(conn.fire) == "function" then
+                conn:fire(x, y)
+                invokedAny = true
+            elseif type(conn.Function) == "function" then
+                conn.Function(x, y)
+                invokedAny = true
+            end
+        end)
+    end
+    return invokedAny
+end
+
 local function readCosmicValue(itemSlot, displayName, referenceValue)
     if cvCache[displayName] then return cvCache[displayName] end
     local refNum = tonumber(referenceValue)
@@ -1414,9 +1453,11 @@ local function readCosmicValue(itemSlot, displayName, referenceValue)
     local fire = getgenv and getgenv().firesignal or firesignal
     local moveMouse = (getgenv and (getgenv().mousemoveabs or getgenv().MouseMoveAbs))
         or mousemoveabs or MouseMoveAbs
+    local hasDirectInvoke = (getgenv and (getgenv().getconnections or getgenv().get_signal_cons))
+        or getconnections or get_signal_cons
 
-    if type(fire) ~= "function" and type(moveMouse) ~= "function" then
-        warn("[CV] Neither firesignal() nor mousemoveabs() is available in this executor - Cosmic Value cannot be read")
+    if type(fire) ~= "function" and type(moveMouse) ~= "function" and type(hasDirectInvoke) ~= "function" then
+        warn("[CV] No firesignal(), mousemoveabs(), or getconnections() available in this executor - Cosmic Value cannot be read")
         return nil
     end
 
@@ -1425,6 +1466,17 @@ local function readCosmicValue(itemSlot, displayName, referenceValue)
     local overlayFoundCount = 0
     for attempt = 1, 4 do
         print("[CV] Attempting read for " .. tostring(displayName) .. " (attempt " .. attempt .. "/4)")
+
+        -- Direct invoke first: doesn't need window focus, doesn't need a
+        -- real or fake mouse at all - just calls PS99's own hover-handler
+        -- function(s) in the Lua VM. If this alone opens the tooltip, the
+        -- mousemoveabs/firesignal attempts below become redundant but
+        -- harmless (they just re-fire the same hover state).
+        local directOk = tryDirectInvoke(itemSlot.MouseMoved, 0, 0)
+        directOk = tryDirectInvoke(itemSlot.MouseEnter, 0, 0) or directOk
+        if attempt == 1 and type(hasDirectInvoke) == "function" and not directOk then
+            warn("[CV] getconnections() available but no connections could be invoked for " .. tostring(displayName) .. " - falling back to mousemoveabs/firesignal")
+        end
 
         if type(moveMouse) == "function" then
             local ok = pcall(function()
@@ -1438,7 +1490,7 @@ local function readCosmicValue(itemSlot, displayName, referenceValue)
             if not ok then
                 warn("[CV] mousemoveabs failed for " .. tostring(displayName))
             end
-        elseif attempt == 1 then
+        elseif attempt == 1 and not directOk then
             warn("[CV] mousemoveabs() not available in this executor - relying on firesignal alone, which is known not to reliably populate the tooltip by itself")
         end
 
