@@ -3788,7 +3788,7 @@ print("[BOT] [OK] Ready! " .. #supporteditems .. " live catalog entries loaded."
 -- was it. Flip ANTI_AFK_ENABLED back to true to re-enable once confirmed
 -- either way (or once there's a touch-based anti-AFK instead of a
 -- keyboard-based one).
-local ANTI_AFK_ENABLED = false
+local ANTI_AFK_ENABLED = true
 if ANTI_AFK_ENABLED then
 task.spawn(function()
     task.wait(8)
