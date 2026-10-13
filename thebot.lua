@@ -1470,7 +1470,6 @@ end
 -- located (e.g. no getupvalues/getconnections support).
 local cosmicValueTable = nil         -- cached once found; nil until located
 local cosmicValueTableSearchFailed = false -- true once the search itself fails outright this session
-local cvDirectFieldNamesLogged = false     -- one-time diagnostic print of the real field names
 
 local function cvVariantFlags(variant)
     variant = tostring(variant or "normal"):lower()
@@ -1603,10 +1602,17 @@ local function locateCosmicValueTable(itemSlot)
     return nil
 end
 
+local cvDirectFieldNamesLogCount = 0
+local CV_DIRECT_FIELD_LOG_MAX = 10 -- print raw entries for the first N lookups, not just one, for real diagnosis
+
 -- Direct, instant, no-mouse Cosmic Value lookup. Returns {value=, demand=}
 -- or nil if not found/not available - callers fall back to the
--- hover-based readCosmicValue in that case.
-local function readCosmicValueDirect(itemSlot, baseName, variant)
+-- hover-based readCosmicValue in that case. referenceValue is the pet's
+-- own last-known catalog price (same plausibility reference the
+-- hover-based reader already uses) - without this, a wrong field guess
+-- (e.g. picking demand=7 instead of the real price) would silently credit
+-- a nonsense number instead of getting caught.
+local function readCosmicValueDirect(itemSlot, baseName, variant, referenceValue)
     local tbl = locateCosmicValueTable(itemSlot)
     if not tbl then return nil end
 
@@ -1619,21 +1625,24 @@ local function readCosmicValueDirect(itemSlot, baseName, variant)
         return nil
     end
 
-    if not cvDirectFieldNamesLogged then
-        cvDirectFieldNamesLogged = true
+    if cvDirectFieldNamesLogCount < CV_DIRECT_FIELD_LOG_MAX then
+        cvDirectFieldNamesLogCount = cvDirectFieldNamesLogCount + 1
         local parts = {}
         for k, v in pairs(entry) do
-            table.insert(parts, tostring(k) .. "=" .. tostring(v))
+            table.insert(parts, tostring(k) .. "=" .. typeof(v) .. ":" .. tostring(v))
         end
-        print("[CV-DIRECT] First successful lookup, raw entry for '" .. key .. "': " .. table.concat(parts, ", "))
+        print("[CV-DIRECT] Raw entry for '" .. key .. "': " .. table.concat(parts, ", "))
     end
 
     -- Probe common field-name candidates first; fall back to the first
     -- numeric field found at all if none of the named candidates match -
-    -- the one-time log above tells us the real names so this can be
-    -- tightened later if needed.
+    -- the diagnostic log above tells us the real field names. Demand-like
+    -- keys are explicitly excluded from the price fallback scan so a
+    -- demand number (small, 1-10) can never get mistaken for a price.
     local valueCandidates = {"v", "Value", "value", "cv", "CosmicValue", "cosmicValue", "amount", "Amount", "price", "Price"}
     local demandCandidates = {"d", "Demand", "demand", "dem"}
+    local demandKeySet = {}
+    for _, k in ipairs(demandCandidates) do demandKeySet[k] = true end
 
     local value = nil
     for _, k in ipairs(valueCandidates) do
@@ -1641,8 +1650,8 @@ local function readCosmicValueDirect(itemSlot, baseName, variant)
         if type(val) == "number" then value = val; break end
     end
     if not value then
-        for _, v in pairs(entry) do
-            if type(v) == "number" then value = v; break end
+        for k, v in pairs(entry) do
+            if type(v) == "number" and not demandKeySet[k] then value = v; break end
         end
     end
 
@@ -1657,6 +1666,24 @@ local function readCosmicValueDirect(itemSlot, baseName, variant)
         return nil
     end
 
+    -- Same plausibility guard the hover-based reader already relies on:
+    -- refuse a read that's wildly below (or implausibly above) this pet's
+    -- own known catalog value, rather than silently crediting a
+    -- misidentified field. Falls back to the hover method in that case.
+    local refNum = tonumber(referenceValue)
+    if refNum and refNum > 0 then
+        if value < refNum * CV_PLAUSIBILITY_FLOOR then
+            print("[CV-DIRECT-REJECT] " .. key .. ": read " .. tostring(value) ..
+                " but catalog value is " .. tostring(refNum) .. " - refusing as implausibly low, falling back to hover method")
+            return nil
+        end
+        if value > refNum * 50 then
+            print("[CV-DIRECT-REJECT] " .. key .. ": read " .. tostring(value) ..
+                " but catalog value is only " .. tostring(refNum) .. " - refusing as implausibly high, falling back to hover method")
+            return nil
+        end
+    end
+
     return { value = math.floor(value), demand = demand }
 end
 
@@ -1665,7 +1692,7 @@ local function readCosmicValue(itemSlot, displayName, referenceValue, baseName, 
 
     -- Try the instant, no-mouse direct lookup first.
     if baseName then
-        local direct = readCosmicValueDirect(itemSlot, baseName, variant)
+        local direct = readCosmicValueDirect(itemSlot, baseName, variant, referenceValue)
         if direct then
             cvCache[displayName] = direct
             print("[CV-DIRECT] " .. tostring(displayName) .. " = " .. tostring(direct.value) .. " demand=" .. tostring(direct.demand))
