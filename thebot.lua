@@ -3777,6 +3777,19 @@ print("[BOT] [OK] Ready! " .. #supporteditems .. " live catalog entries loaded."
 -- ============================================================
 -- ANTI-AFK — Hoverboard toggle every 15s
 -- ============================================================
+-- Operator report (2026-10-12): crashes ~10s after execution on ANDROID
+-- (Xeno/Delta), at the same fixed timing even after loop-frequency fixes
+-- that would have changed the timing if THOSE were the cause - pointing
+-- instead at something tied to this block's own fixed 8-second delay.
+-- keypress/keyrelease specifically simulate a PHYSICAL KEYBOARD key - on a
+-- touch-only Android device, the executor has to fake that entirely, and
+-- faking keyboard input on hardware that has none is a believable crash
+-- source. Disabled entirely for now as a test - if the crash stops, this
+-- was it. Flip ANTI_AFK_ENABLED back to true to re-enable once confirmed
+-- either way (or once there's a touch-based anti-AFK instead of a
+-- keyboard-based one).
+local ANTI_AFK_ENABLED = false
+if ANTI_AFK_ENABLED then
 task.spawn(function()
     task.wait(8)
 
@@ -3901,6 +3914,7 @@ task.spawn(function()
         end)
     end
 end)
+end -- ANTI_AFK_ENABLED
 
 pcall(function()
     localPlayer.Idled:Connect(function()
