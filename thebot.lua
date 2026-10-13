@@ -1445,8 +1445,197 @@ local function tryDirectInvoke(signal, x, y)
     return invokedAny
 end
 
-local function readCosmicValue(itemSlot, displayName, referenceValue)
+-- ============================================================
+-- COSMIC VALUE DIRECT TABLE LOOKUP (no mouse, no hover, no window focus)
+-- ============================================================
+-- Found live (2026-10-13) via getconnections/getupvalues/getconstants
+-- introspection on a real trade's ItemSlot: Cosmic Value is NOT fetched
+-- over the network and is NOT baked into the pet's static catalog table -
+-- it's a plain Lua table already sitting in the client's memory, captured
+-- as a closure upvalue of the trade tooltip's own hover-handler chain
+-- (constants on that handler literally include "CosmicValues",
+-- "CosmicValuesOverlay", "GetValue"). The table itself: ~5732 entries,
+-- keyed by "PetName|variantFlag|shinyFlag" (variantFlag ""=normal,
+-- "1"=golden, "2"=rainbow - matches the "pt" field already seen in PS99's
+-- own trade stack keys; shinyFlag ""=not shiny, "1"=shiny), each value
+-- itself a small table (price + other fields).
+--
+-- Since this is a real, already-loaded Lua table (not a render/GUI
+-- artifact), reading it is a plain, instant table lookup - no mouse
+-- movement, no hover event, no tooltip GUI, no window focus requirement
+-- at all. It works identically whether the Roblox window is focused,
+-- alt-tabbed, or minimized. This is tried FIRST; the hover-based
+-- readCosmicValue below (mousemoveabs/firesignal/direct-invoke) stays as
+-- an automatic fallback only for executors where this table can't be
+-- located (e.g. no getupvalues/getconnections support).
+local cosmicValueTable = nil         -- cached once found; nil until located
+local cosmicValueTableSearchFailed = false -- true once the search itself fails outright this session
+local cvDirectFieldNamesLogged = false     -- one-time diagnostic print of the real field names
+
+local function cvVariantFlags(variant)
+    variant = tostring(variant or "normal"):lower()
+    local shiny = variant:find("shiny") ~= nil
+    local base = variant:gsub("shiny_?", "")
+    local variantFlag = ""
+    if base == "golden" then
+        variantFlag = "1"
+    elseif base == "rainbow" then
+        variantFlag = "2"
+    end
+    local shinyFlag = shiny and "1" or ""
+    return variantFlag, shinyFlag
+end
+
+-- Walks a function's upvalues (and the upvalues of any function found
+-- inside a table's own values) looking for a table shaped like the real
+-- Cosmic Value table: a few hundred+ entries, at least one string key
+-- containing "|". Bounded depth + a `seen` set so it can't loop forever
+-- on self-referential/shared tables.
+local function searchForCosmicValueTable(fn, depth, seen)
+    depth = depth or 1
+    seen = seen or {}
+    if depth > 6 then return nil end
+
+    local getups = getupvalues or (getgenv and getgenv().getupvalues) or (debug and debug.getupvalues)
+    if type(getups) ~= "function" then return nil end
+
+    local ok, ups = pcall(getups, fn)
+    if not ok or type(ups) ~= "table" then return nil end
+
+    for _, v in pairs(ups) do
+        local t = typeof(v)
+        if t == "table" and not seen[v] then
+            seen[v] = true
+            local count = 0
+            local hasPipeKey = false
+            for k in pairs(v) do
+                count = count + 1
+                if type(k) == "string" and k:find("|") then hasPipeKey = true end
+                if count > 2000 then break end
+            end
+            if count > 500 and hasPipeKey then
+                return v
+            end
+            for _, inner in pairs(v) do
+                if type(inner) == "function" then
+                    local found = searchForCosmicValueTable(inner, depth + 1, seen)
+                    if found then return found end
+                end
+            end
+        elseif t == "function" then
+            local found = searchForCosmicValueTable(v, depth + 1, seen)
+            if found then return found end
+        end
+    end
+
+    return nil
+end
+
+local function locateCosmicValueTable(itemSlot)
+    if cosmicValueTable then return cosmicValueTable end
+    if cosmicValueTableSearchFailed then return nil end
+    if not itemSlot then return nil end
+
+    local getConns = getgenv and (getgenv().getconnections or getgenv().get_signal_cons)
+        or getconnections or get_signal_cons
+    if type(getConns) ~= "function" then
+        cosmicValueTableSearchFailed = true
+        warn("[CV-DIRECT] getconnections() not available in this executor - direct lookup impossible, falling back to hover method")
+        return nil
+    end
+
+    local ok, conns = pcall(function() return getConns(itemSlot.MouseEnter) end)
+    if not ok or type(conns) ~= "table" then return nil end
+
+    for _, conn in ipairs(conns) do
+        local fn = conn.Function
+        if type(fn) == "function" then
+            local found = searchForCosmicValueTable(fn, 1, {})
+            if found then
+                cosmicValueTable = found
+                print("[CV-DIRECT] Located Cosmic Value table (" .. tostring((function()
+                    local n = 0
+                    for _ in pairs(found) do n = n + 1 end
+                    return n
+                end)()) .. " entries) - direct lookups now active, no mouse/hover/focus needed")
+                return cosmicValueTable
+            end
+        end
+    end
+
+    return nil
+end
+
+-- Direct, instant, no-mouse Cosmic Value lookup. Returns {value=, demand=}
+-- or nil if not found/not available - callers fall back to the
+-- hover-based readCosmicValue in that case.
+local function readCosmicValueDirect(itemSlot, baseName, variant)
+    local tbl = locateCosmicValueTable(itemSlot)
+    if not tbl then return nil end
+
+    local variantFlag, shinyFlag = cvVariantFlags(variant)
+    local key = tostring(baseName) .. "|" .. variantFlag .. "|" .. shinyFlag
+
+    local entry = tbl[key]
+    if type(entry) ~= "table" then
+        print("[CV-DIRECT] No entry for key '" .. key .. "' - falling back to hover method for this item")
+        return nil
+    end
+
+    if not cvDirectFieldNamesLogged then
+        cvDirectFieldNamesLogged = true
+        local parts = {}
+        for k, v in pairs(entry) do
+            table.insert(parts, tostring(k) .. "=" .. tostring(v))
+        end
+        print("[CV-DIRECT] First successful lookup, raw entry for '" .. key .. "': " .. table.concat(parts, ", "))
+    end
+
+    -- Probe common field-name candidates first; fall back to the first
+    -- numeric field found at all if none of the named candidates match -
+    -- the one-time log above tells us the real names so this can be
+    -- tightened later if needed.
+    local valueCandidates = {"v", "Value", "value", "cv", "CosmicValue", "cosmicValue", "amount", "Amount", "price", "Price"}
+    local demandCandidates = {"d", "Demand", "demand", "dem"}
+
+    local value = nil
+    for _, k in ipairs(valueCandidates) do
+        local val = entry[k]
+        if type(val) == "number" then value = val; break end
+    end
+    if not value then
+        for _, v in pairs(entry) do
+            if type(v) == "number" then value = v; break end
+        end
+    end
+
+    local demand = nil
+    for _, k in ipairs(demandCandidates) do
+        local val = entry[k]
+        if type(val) == "number" then demand = val; break end
+    end
+
+    if not value then
+        print("[CV-DIRECT] Entry found for '" .. key .. "' but no numeric value field matched - falling back to hover method")
+        return nil
+    end
+
+    return { value = math.floor(value), demand = demand }
+end
+
+local function readCosmicValue(itemSlot, displayName, referenceValue, baseName, variant)
     if cvCache[displayName] then return cvCache[displayName] end
+
+    -- Try the instant, no-mouse direct lookup first.
+    if baseName then
+        local direct = readCosmicValueDirect(itemSlot, baseName, variant)
+        if direct then
+            cvCache[displayName] = direct
+            print("[CV-DIRECT] " .. tostring(displayName) .. " = " .. tostring(direct.value) .. " demand=" .. tostring(direct.demand))
+            return direct
+        end
+    end
+
     local refNum = tonumber(referenceValue)
     task.wait(CV_INTER_ITEM_SETTLE_SECONDS)
 
@@ -2235,7 +2424,7 @@ local function checkItems(isWithdrawal)
 
             local cosmicValue, demand = nil, nil
             if isAcceptedTier then
-                local cv = readCosmicValue(item, displayName, entry and entry.value)
+                local cv = readCosmicValue(item, displayName, entry and entry.value, baseName, variant)
                 if cv then
                     cosmicValue = cv.value
                     demand = cv.demand
