@@ -1531,6 +1531,23 @@ local function searchForCosmicValueTable(fn, depth, seen)
     return nil
 end
 
+-- Guards the deep upvalue walk in a pcall - some upvalues deep in the
+-- tree can be non-standard tables (Instance proxies, metatable-guarded
+-- tables) that throw on a plain pairs() iteration. Without this, one bad
+-- table anywhere in the tree would silently abort the whole search with
+-- no error ever surfacing (readCosmicValueDirect just sees locate return
+-- nil) - this makes any such failure visible instead.
+local function safeSearchForCosmicValueTable(fn)
+    local ok, result = pcall(searchForCosmicValueTable, fn, 1, {})
+    if not ok then
+        warn("[CV-DIRECT] Search threw an error (treating as not-found): " .. tostring(result))
+        return nil
+    end
+    return result
+end
+
+local cvDirectSearchAttempts = 0
+
 local function locateCosmicValueTable(itemSlot)
     if cosmicValueTable then return cosmicValueTable end
     if cosmicValueTableSearchFailed then return nil end
@@ -1545,22 +1562,42 @@ local function locateCosmicValueTable(itemSlot)
     end
 
     local ok, conns = pcall(function() return getConns(itemSlot.MouseEnter) end)
-    if not ok or type(conns) ~= "table" then return nil end
+    if not ok then
+        warn("[CV-DIRECT] getconnections(itemSlot.MouseEnter) threw: " .. tostring(conns))
+        return nil
+    end
+    if type(conns) ~= "table" then
+        warn("[CV-DIRECT] getconnections(itemSlot.MouseEnter) returned " .. typeof(conns) .. " instead of a table")
+        return nil
+    end
 
-    for _, conn in ipairs(conns) do
+    cvDirectSearchAttempts = cvDirectSearchAttempts + 1
+    print("[CV-DIRECT] Search attempt #" .. cvDirectSearchAttempts .. " | MouseEnter connections found: " .. #conns)
+
+    local checkedCount = 0
+    for i, conn in ipairs(conns) do
         local fn = conn.Function
         if type(fn) == "function" then
-            local found = searchForCosmicValueTable(fn, 1, {})
+            checkedCount = checkedCount + 1
+            local found = safeSearchForCosmicValueTable(fn)
             if found then
                 cosmicValueTable = found
-                print("[CV-DIRECT] Located Cosmic Value table (" .. tostring((function()
-                    local n = 0
-                    for _ in pairs(found) do n = n + 1 end
-                    return n
-                end)()) .. " entries) - direct lookups now active, no mouse/hover/focus needed")
+                local n = 0
+                for _ in pairs(found) do n = n + 1 end
+                print("[CV-DIRECT] Located Cosmic Value table via connection #" .. i .. " (" .. n .. " entries) - direct lookups now active, no mouse/hover/focus needed")
                 return cosmicValueTable
+            else
+                print("[CV-DIRECT] Connection #" .. i .. ": searched, no matching table found (up to depth 6)")
             end
+        else
+            print("[CV-DIRECT] Connection #" .. i .. ": .Function is " .. typeof(fn) .. ", not inspectable")
         end
+    end
+
+    if checkedCount == 0 then
+        print("[CV-DIRECT] No connections had an inspectable .Function - this executor's getconnections() may use a different shape (e.g. :Fire() only)")
+    else
+        print("[CV-DIRECT] Searched " .. checkedCount .. " connection(s), table not found this attempt - will retry on next item")
     end
 
     return nil
