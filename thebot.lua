@@ -33,7 +33,14 @@ local players           = game:GetService("Players")
 local replicatedStorage = game:GetService("ReplicatedStorage")
 local virtualUser       = game:GetService("VirtualUser")
 local textChatService   = game:GetService("TextChatService")
+-- Auto-execute (Volt) fires this script right at launch, before
+-- Players.LocalPlayer is guaranteed to be set yet - a manual run always
+-- happened well after that point, which is why this only crashed under
+-- auto-execute. Wait for it instead of assuming it already exists.
 local localPlayer = players.LocalPlayer
+if not localPlayer then
+    localPlayer = players.PlayerAdded:Wait()
+end
 
 -- ============================================================
 -- EXECUTOR HTTP REQUEST
