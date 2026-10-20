@@ -4456,28 +4456,43 @@ task.spawn(function()
             continue
         end
 
-        local trade = incoming[1]
-        local username = trade.Name
-        local userId = tostring(trade.UserId)
+        -- Real bug (operator report, 2026-10-19, live screenshot + log):
+        -- this always took incoming[1] - whichever request happened to be
+        -- first in GetAllRequests()'s own order - with nothing to skip
+        -- past one that's on hold. A single blocked/unlinked account's
+        -- request sitting at the front monopolized the bot completely:
+        -- confirmed live, one user's request got retried every ~10s for
+        -- 6+ minutes straight while 5-6 OTHER real pending requests
+        -- (visible in the trade list) were never even looked at. Now
+        -- scans for the first request whose user ISN'T currently on
+        -- hold, so a blocked request no longer blocks everyone behind it
+        -- in the queue - it just gets skipped (not declined) until its
+        -- own hold expires and it's naturally reconsidered again.
+        local trade = nil
+        for _, candidate in ipairs(incoming) do
+            local candidateId = tostring(candidate.UserId)
+            local candidateHold = tonumber(withdrawalHoldUntil[candidateId]) or 0
+            if candidateHold <= tick() then
+                trade = candidate
+                break
+            end
+        end
 
-        local holdUntil = tonumber(withdrawalHoldUntil[userId]) or 0
-        if holdUntil > tick() then
-            -- Operator report (2026-10-19): this used to print every single
-            -- tick (5x/sec) for the entire hold window - thousands of
-            -- identical lines an hour for one blocked user sitting in the
-            -- server. The hold being SET already prints once (see
-            -- "[WITHDRAW-GUARD] Set repeated-request cooldown..." below) -
-            -- nothing useful was added by also announcing every check
-            -- against it, silently declining is enough here.
+        if not trade then
+            -- Every pending request right now is on hold - decline the
+            -- front of the queue same as before rather than leave it
+            -- sitting there untouched forever.
             pcall(function()
                 if type(tradingCommands.DeclineRequest) == "function" then
-                    tradingCommands.DeclineRequest(trade)
+                    tradingCommands.DeclineRequest(incoming[1])
                 end
             end)
             continue
-        else
-            withdrawalHoldUntil[userId] = nil
         end
+
+        local username = trade.Name
+        local userId = tostring(trade.UserId)
+        withdrawalHoldUntil[userId] = nil
 
         if activeIncomingTrade then
             continue
