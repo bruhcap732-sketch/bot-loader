@@ -166,8 +166,20 @@ local goNext             = true
 local activeIncomingTrade = false
 local activeIncomingUserId = nil
 local activeIncomingSince = 0
-local withdrawalHoldUntil = {}
-local WITHDRAWAL_HOLD_COOLDOWN = 30
+-- Operator report (2026-10-19): console flooded for an hour straight while
+-- a blocked user sat in the server, re-declining AND re-printing every
+-- single tick (5x/sec) for as long as they stayed. First fix tried a 5min
+-- time-based cooldown instead of 30s - operator follow-up: "remove the
+-- whole waiting thing... skip the user if it can't detect the first 3
+-- times, and reject their trade." No time-based retry at all any more -
+-- a per-user attempt COUNTER instead. Fails 3 times -> permanently
+-- declined on sight (no more lookups, no more logging) until the script
+-- restarts or withdrawalFailCount is cleared some other way - there's no
+-- reliable "they sent a genuinely new trade" signal to auto-reset on (see
+-- the main loop's own comment: GetAllRequests() exposes no per-request id
+-- at the pending stage to tell a stale request from a fresh one).
+local withdrawalFailCount = {}
+local WITHDRAWAL_MAX_FAILS = 3
 local method             = nil
 local tradeId            = 0
 local lastTradeUsername  = nil
@@ -723,6 +735,10 @@ local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfil
             " | withdrawalId=" .. tostring(withdrawalData.id))
 
         if s and r and status == 200 and data and data.success then
+            -- A real, confirmed withdrawal just went through for this user -
+            -- clear any earlier fail count so a PAST unrelated block doesn't
+            -- carry over and auto-reject a future legitimate withdrawal.
+            withdrawalFailCount[tostring(userId)] = nil
             return true, data
         end
 
@@ -4452,19 +4468,17 @@ task.spawn(function()
         local username = trade.Name
         local userId = tostring(trade.UserId)
 
-        local holdUntil = tonumber(withdrawalHoldUntil[userId]) or 0
-        if holdUntil > tick() then
-            print("[TRADE] Ignoring repeated blocked-withdrawal request | user=" ..
-                tostring(username) .. " | cooldown=" ..
-                string.format("%.1fs", holdUntil - tick()))
+        -- Operator report (2026-10-19): permanently declined on sight once
+        -- this user has failed WITHDRAWAL_MAX_FAILS times - no lookup, no
+        -- logging, just a silent decline. No time-based retry any more; see
+        -- withdrawalFailCount's own doc comment above for why.
+        if (withdrawalFailCount[userId] or 0) >= WITHDRAWAL_MAX_FAILS then
             pcall(function()
                 if type(tradingCommands.DeclineRequest) == "function" then
                     tradingCommands.DeclineRequest(trade)
                 end
             end)
             continue
-        else
-            withdrawalHoldUntil[userId] = nil
         end
 
         if activeIncomingTrade then
@@ -4659,7 +4673,9 @@ task.spawn(function()
                 sendMessage("BloxyFlip could not verify your account. Please try again.")
             end
 
-            withdrawalHoldUntil[userId] = tick() + WITHDRAWAL_HOLD_COOLDOWN
+            withdrawalFailCount[userId] = (withdrawalFailCount[userId] or 0) + 1
+            print("[WITHDRAW-GUARD] Fail " .. tostring(withdrawalFailCount[userId]) .. "/" ..
+                tostring(WITHDRAWAL_MAX_FAILS) .. " for " .. tostring(username))
             goNext = true
             tradeId = 0
             lastGameTradeId = nil
@@ -4691,9 +4707,9 @@ task.spawn(function()
             sendMessage("Your withdrawal is still active, but the bot cannot fulfill it yet.")
             sendMessage("Please wait for the withdrawal to become available, then trade again.")
 
-            withdrawalHoldUntil[userId] = tick() + WITHDRAWAL_HOLD_COOLDOWN
-            print("[WITHDRAW-GUARD] Set repeated-request cooldown for " ..
-                tostring(username) .. " (" .. tostring(WITHDRAWAL_HOLD_COOLDOWN) .. "s)")
+            withdrawalFailCount[userId] = (withdrawalFailCount[userId] or 0) + 1
+            print("[WITHDRAW-GUARD] Fail " .. tostring(withdrawalFailCount[userId]) .. "/" ..
+                tostring(WITHDRAWAL_MAX_FAILS) .. " for " .. tostring(username))
 
             goNext = true
             tradeId = 0
