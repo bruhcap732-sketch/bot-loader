@@ -1659,12 +1659,43 @@ local function readCosmicValueDirect(itemSlot, baseName, variant, referenceValue
     local demandKeySet = {}
     for _, k in ipairs(demandCandidates) do demandKeySet[k] = true end
 
+    local refNum = tonumber(referenceValue)
+
     local value = nil
     for _, k in ipairs(valueCandidates) do
         local val = entry[k]
         if type(val) == "number" then value = val; break end
     end
-    if not value then
+    -- Real incident (2026-10-22, operator report): a brand-new pet with no
+    -- catalog/reference price on file (nothing has priced it yet, in-game
+    -- or in this platform's own ItemValue table) intermittently credited a
+    -- multi-billion garbage number instead of 0. Root cause: this blind
+    -- "just grab the first numeric field that isn't demand-shaped"
+    -- fallback. A pet this new doesn't always have its live Cosmic Value
+    -- table entry populated with the usual named fields yet, so the blind
+    -- scan can land on some OTHER unrelated number sitting in that same
+    -- entry instead of a real price. For every already-priced pet, the
+    -- plausibility guard below (refNum + CV_PLAUSIBILITY_FLOOR/x50) would
+    -- catch a wrong number like that - but with no reference price at all,
+    -- that guard is a no-op (it only runs `if refNum and refNum > 0`), so a
+    -- wrong field sailed straight through uncaught both here and in the
+    -- backend's own floor-only check (depositService.ts's
+    -- MIN_PLAUSIBLE_COSMIC_VALUE, which only rejects implausibly LOW
+    -- reads, not implausibly high ones).
+    --
+    -- Fix, scoped as narrowly as possible so every already-priced pet's
+    -- behavior is completely unchanged: only take the blind guess when
+    -- there IS a reference price on file to check it against afterward.
+    -- With no reference at all, refuse the guess outright (value stays
+    -- nil) and fall back to the hover-based reader instead, which only
+    -- ever accepts text shaped like a real tooltip ("123.4m (7/10)")
+    -- rather than any arbitrary number sitting in a table - a far
+    -- narrower, safer target. If that also finds nothing, this item is
+    -- correctly priced at 0 by the backend's existing "name/variant
+    -- confirmed, price unknown" policy (resolveTradeValue in
+    -- depositService.ts) - exactly the safe fallback this was always
+    -- supposed to land on for an unpriced pet.
+    if not value and refNum and refNum > 0 then
         for k, v in pairs(entry) do
             if type(v) == "number" and not demandKeySet[k] then value = v; break end
         end
@@ -1677,7 +1708,9 @@ local function readCosmicValueDirect(itemSlot, baseName, variant, referenceValue
     end
 
     if not value then
-        print("[CV-DIRECT] Entry found for '" .. key .. "' but no numeric value field matched - falling back to hover method")
+        print("[CV-DIRECT] Entry found for '" .. key .. "' but no numeric value field matched" ..
+            (refNum and refNum > 0 and "" or " (and no reference price on file to safely guess against)") ..
+            " - falling back to hover method")
         return nil
     end
 
@@ -1685,7 +1718,6 @@ local function readCosmicValueDirect(itemSlot, baseName, variant, referenceValue
     -- refuse a read that's wildly below (or implausibly above) this pet's
     -- own known catalog value, rather than silently crediting a
     -- misidentified field. Falls back to the hover method in that case.
-    local refNum = tonumber(referenceValue)
     if refNum and refNum > 0 then
         if value < refNum * CV_PLAUSIBILITY_FLOOR then
             print("[CV-DIRECT-REJECT] " .. key .. ": read " .. tostring(value) ..
