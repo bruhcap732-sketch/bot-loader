@@ -1510,6 +1510,45 @@ end
 -- later deposit of the same pet name.
 -- ============================================================
 local CV_PLAUSIBILITY_FLOOR = 0.1 -- a real read must be at least 10% of this pet's own catalog value
+
+-- Operator report (2026-10-24, voice): "the bot is so fucking slow... it's
+-- scanning like 100 pets at once and it's taking too long." Real cause:
+-- with Cosmic Value genuinely removed from the game this update, BOTH the
+-- CV-DIRECT table search (a deep getupvalues walk through every MouseEnter
+-- connection, up to depth 6) and the 4-attempt hover simulation below can
+-- never succeed any more - but nothing stopped either one from running in
+-- full, from scratch, on every single accepted-tier item in a deposit.
+-- A 100-pet withdrawal/deposit paid that full dead-end cost 100 times in a
+-- row. cosmicLastFailedAt turns that into "pay it once, then skip for a
+-- while": the moment a read fails outright (nothing found anywhere), every
+-- read attempted within COSMIC_RETRY_COOLDOWN_SECONDS returns nil
+-- immediately (straight to the RAP fallback in checkItems, no search, no
+-- hover, no waits) instead of repeating the whole dead-end search. Still
+-- self-heals if PS99 brings Cosmic Value back mid-session - it's a cooldown,
+-- not a permanent give-up - the next read after the cooldown expires tries
+-- for real again, and if that one succeeds, cvCache + the direct-table
+-- cache both start working normally again from there.
+local cosmicLastFailedAt = 0
+local COSMIC_RETRY_COOLDOWN_SECONDS = 60
+
+-- Operator request (2026-10-24, voice): "it should be a second, no matter
+-- how many huges you add" - even with the 60s cooldown above, the FIRST
+-- pet after a cooldown window still pays the real hover-simulation cost
+-- (mouse movement, real waits) before falling back to RAP, because that
+-- first attempt is what the cooldown itself is timed from. With Cosmic
+-- Value confirmed fully removed from the game (not a glitch expected back
+-- any moment), there is no real attempt left to make - every one of those
+-- "first pet" hover attempts is paying real time for a read that cannot
+-- succeed. Set to false: checkItems() below skips readCosmicValue()
+-- (the whole hover/CV-DIRECT machinery) entirely and goes straight from
+-- name -> lookupGemValue() (a plain instant table read, no mouse, no
+-- waits) for every single item, every time - genuinely as fast as the
+-- RAP table lookup itself, regardless of how many Huges are in the trade.
+-- Flip back to true once PS99 actually restores Cosmic Value - the full
+-- hover-based reader is untouched below, just not called while this is
+-- false.
+local USE_COSMIC_HOVER_READ = false
+
 -- Copied verbatim from the proven thebot.lua (2026-10-11, operator
 -- request: "copy the hovering thing") - this version ACTUALLY FORCES the
 -- hover (moves the real cursor to the item slot + fires MouseEnter) before
@@ -1838,6 +1877,15 @@ end
 local function readCosmicValue(itemSlot, displayName, referenceValue, baseName, variant)
     if cvCache[displayName] then return cvCache[displayName] end
 
+    -- See cosmicLastFailedAt's own doc comment above (right after
+    -- CV_PLAUSIBILITY_FLOOR) for the real incident this fixes - skips BOTH
+    -- the expensive direct-table search and the 4-attempt hover simulation
+    -- below entirely while a recent read has already failed outright, so a
+    -- 100-pet deposit doesn't pay that dead-end cost on every single item.
+    if cosmicLastFailedAt > 0 and (tick() - cosmicLastFailedAt) < COSMIC_RETRY_COOLDOWN_SECONDS then
+        return nil
+    end
+
     -- Try the instant, no-mouse direct lookup first.
     if baseName then
         local direct = readCosmicValueDirect(itemSlot, baseName, variant, referenceValue)
@@ -1859,6 +1907,7 @@ local function readCosmicValue(itemSlot, displayName, referenceValue, baseName, 
 
     if type(fire) ~= "function" and type(moveMouse) ~= "function" and type(hasDirectInvoke) ~= "function" then
         warn("[CV] No firesignal(), mousemoveabs(), or getconnections() available in this executor - Cosmic Value cannot be read")
+        cosmicLastFailedAt = tick()
         return nil
     end
 
@@ -1978,6 +2027,7 @@ local function readCosmicValue(itemSlot, displayName, referenceValue, baseName, 
         warn("[CV-FAIL] " .. tostring(displayName) .. ": InfoOverlay opened (" .. overlayFoundCount .. "/4 attempts) but was completely empty of text.")
     end
 
+    cosmicLastFailedAt = tick()
     return nil
 end
 
@@ -2636,21 +2686,27 @@ local function checkItems(isWithdrawal)
 
             local cosmicValue, demand = nil, nil
             if isAcceptedTier then
-                local cv = readCosmicValue(item, displayName, entry and entry.value, baseName, variant)
-                if cv then
-                    cosmicValue = cv.value
-                    demand = cv.demand
-                else
-                    -- Cosmic Value genuinely unreadable (PS99 pulled the
-                    -- tooltip in today's update) - fall back to the RAP
-                    -- value fetched directly from Big Games' own API at
-                    -- startup (see GEM VALUE FALLBACK section above).
+                if USE_COSMIC_HOVER_READ then
+                    local cv = readCosmicValue(item, displayName, entry and entry.value, baseName, variant)
+                    if cv then
+                        cosmicValue = cv.value
+                        demand = cv.demand
+                    end
+                end
+                if not cosmicValue then
+                    -- Either USE_COSMIC_HOVER_READ is off (the current
+                    -- default - see its own doc comment), or it's on and
+                    -- the hover read genuinely failed. Either way: fall
+                    -- back to the RAP value fetched directly from Big
+                    -- Games' own API at startup (see GEM VALUE FALLBACK
+                    -- section above) - a plain instant name lookup, no
+                    -- mouse, no hover, no wait.
                     local gv = lookupGemValue(baseName, variant)
                     if gv then
                         cosmicValue = gv.value
                         demand = gv.demand
                         print("[GEM-FALLBACK] " .. tostring(displayName) .. " = " .. tostring(gv.value) ..
-                            " (RAP, Cosmic Value unavailable)")
+                            " (RAP" .. (USE_COSMIC_HOVER_READ and ", Cosmic Value unavailable" or "") .. ")")
                     end
                 end
             end
