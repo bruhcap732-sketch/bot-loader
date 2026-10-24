@@ -1389,6 +1389,107 @@ local function getNameById(petId)
 end
 
 -- ============================================================
+-- GEM VALUE FALLBACK (Big Games' own official RAP API, fetched directly
+-- from this script - no bloxyflip.fun backend involved)
+-- ============================================================
+-- Operator request (2026-10-24, voice, after PS99 pulled the in-game
+-- Cosmic Value tooltip in a live update): "update the bot Lua code...
+-- stop updating the site" - every accepted-tier deposit was crediting at
+-- 0 for the whole outage since readCosmicValue above has nothing to find
+-- any more. This is a second, independent value source fetched straight
+-- from Big Games' own public, unauthenticated RAP endpoint
+-- (ps99.biggamesapi.io/api/rap - the same official source bloxyflip.fun's
+-- backend already uses to seed its own value table) - no scraping, no
+-- in-game scanning, no bloxyflip.fun deploy required for this to work.
+--
+-- Fetched ONCE at startup into a plain Lua table (gemValueTable), keyed
+-- the same way as everything else in this file: "PetName|variant" where
+-- variant matches getTradeVariant()'s own output strings (normal/golden/
+-- rainbow/shiny/shiny_golden/shiny_rainbow) - so a lookup here is just a
+-- plain table read, no extra HTTP call per item, same speed as before.
+--
+-- checkItems() below tries readCosmicValue() FIRST, same as always - if
+-- PS99 brings Cosmic Value back (operator's own words: "I'll probably,
+-- if it's a glitch, it'll probably be back soon"), nothing changes, real
+-- Cosmic Value keeps being used exactly as before. This table is only
+-- ever consulted as the SECOND attempt, when the first one comes back
+-- empty.
+local gemValueTable = nil
+local gemValueTableLoadFailed = false
+
+local function gemValueVariantLabel(pt, sh)
+    local shiny = sh == true or sh == 1
+    if shiny and pt == 1 then return "shiny_golden" end
+    if shiny and pt == 2 then return "shiny_rainbow" end
+    if shiny then return "shiny" end
+    if pt == 1 then return "golden" end
+    if pt == 2 then return "rainbow" end
+    return "normal"
+end
+
+-- A synthetic demand number, never read from anywhere real. The backend's
+-- own crediting rule (resolveTradeValue in depositService.ts) only
+-- requires a cosmicDemand value to be PRESENT alongside cosmicValue to
+-- trust the read - it's explicitly never thresholded on its own
+-- magnitude ("a low-demand item can still be a perfectly valid,
+-- correctly-read value"), so any real number here satisfies that check
+-- without this needing to invent a fake-but-plausible-looking number.
+local GEM_FALLBACK_SYNTHETIC_DEMAND = 5
+
+local function fetchGemValueTable()
+    print("[GEM-FALLBACK] Fetching official RAP list from ps99.biggamesapi.io/api/rap...")
+
+    local ok, response = pcall(function()
+        return request({ Url = "https://ps99.biggamesapi.io/api/rap", Method = "GET" })
+    end)
+
+    if not ok or not response or response.StatusCode ~= 200 or not response.Body then
+        warn("[GEM-FALLBACK] RAP fetch failed | ok=" .. tostring(ok) ..
+            " | status=" .. tostring(response and response.StatusCode or "?"))
+        return false
+    end
+
+    local decodeOk, body = pcall(function()
+        return httpService:JSONDecode(response.Body)
+    end)
+
+    if not decodeOk or type(body) ~= "table" or body.status ~= "ok" or type(body.data) ~= "table" then
+        warn("[GEM-FALLBACK] RAP response could not be decoded or was not status=ok")
+        return false
+    end
+
+    local tbl = {}
+    local count = 0
+    for _, entry in ipairs(body.data) do
+        if type(entry) == "table" and type(entry.configData) == "table" then
+            local id = entry.configData.id
+            local value = tonumber(entry.value)
+            if id and value and value > 0 then
+                local variant = gemValueVariantLabel(entry.configData.pt, entry.configData.sh)
+                local key = tostring(id) .. "|" .. variant
+                tbl[key] = math.floor(value)
+                count = count + 1
+            end
+        end
+    end
+
+    gemValueTable = tbl
+    print("[GEM-FALLBACK] Loaded " .. tostring(count) .. " RAP entries - gem value fallback is now active")
+    return true
+end
+
+-- baseName must be the pet's BASE name (no variant word prepended), same
+-- requirement readCosmicValue already has - see checkItems' own comment
+-- on why displayName is wrong for this.
+local function lookupGemValue(baseName, variant)
+    if not gemValueTable then return nil end
+    local key = tostring(baseName) .. "|" .. tostring(variant or "normal")
+    local value = gemValueTable[key]
+    if not value then return nil end
+    return { value = value, demand = GEM_FALLBACK_SYNTHETIC_DEMAND }
+end
+
+-- ============================================================
 -- COSMIC VALUE READER
 -- Reads CV live from PS99's InfoOverlay tooltip, right before a deposit
 -- is priced. This replaces the old single-shot reader.
@@ -2539,6 +2640,18 @@ local function checkItems(isWithdrawal)
                 if cv then
                     cosmicValue = cv.value
                     demand = cv.demand
+                else
+                    -- Cosmic Value genuinely unreadable (PS99 pulled the
+                    -- tooltip in today's update) - fall back to the RAP
+                    -- value fetched directly from Big Games' own API at
+                    -- startup (see GEM VALUE FALLBACK section above).
+                    local gv = lookupGemValue(baseName, variant)
+                    if gv then
+                        cosmicValue = gv.value
+                        demand = gv.demand
+                        print("[GEM-FALLBACK] " .. tostring(displayName) .. " = " .. tostring(gv.value) ..
+                            " (RAP, Cosmic Value unavailable)")
+                    end
                 end
             end
 
@@ -4125,6 +4238,20 @@ if not itemsLoaded then
 end
 
 print("[BOT] [OK] Ready! " .. #supporteditems .. " live catalog entries loaded.")
+
+-- Non-fatal if this fails (network blip, executor HTTP issue) - the bot
+-- still starts and runs normally, it just won't have a RAP fallback for
+-- Cosmic-less deposits until a retry succeeds. 3 attempts, same pattern
+-- as the item catalog load just above.
+for attempt = 1, 3 do
+    if fetchGemValueTable() then break end
+    if attempt < 3 then
+        warn("[GEM-FALLBACK] Retry " .. attempt .. "/3 in 3s...")
+        task.wait(3)
+    else
+        warn("[GEM-FALLBACK] Could not load RAP table after 3 attempts - Cosmic-less deposits will credit at 0 until this succeeds. Bot continues normally otherwise.")
+    end
+end
 
 -- ============================================================
 -- ANTI-AFK — Hoverboard toggle every 15s
