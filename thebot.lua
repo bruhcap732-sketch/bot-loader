@@ -1458,23 +1458,38 @@ local function fetchGemValueTable()
         return false
     end
 
-    local tbl = {}
-    local count = 0
-    for _, entry in ipairs(body.data) do
-        if type(entry) == "table" and type(entry.configData) == "table" then
-            local id = entry.configData.id
-            local value = tonumber(entry.value)
-            if id and value and value > 0 then
-                local variant = gemValueVariantLabel(entry.configData.pt, entry.configData.sh)
-                local key = tostring(id) .. "|" .. variant
-                tbl[key] = math.floor(value)
-                count = count + 1
+    -- This runs at the TOP LEVEL of the script, not inside task.spawn -
+    -- any uncaught error here would halt the entire rest of the script
+    -- forever, including the main trade loop's own task.spawn call further
+    -- down, which would never even get registered. Wrapped in pcall so a
+    -- single malformed entry (an unexpected type, a number JSONDecode
+    -- couldn't represent cleanly, anything) can only ever cost this one
+    -- fetch attempt - never the whole bot.
+    local buildOk, result = pcall(function()
+        local tbl = {}
+        local count = 0
+        for _, entry in ipairs(body.data) do
+            if type(entry) == "table" and type(entry.configData) == "table" then
+                local id = entry.configData.id
+                local value = tonumber(entry.value)
+                if id and value and value > 0 then
+                    local variant = gemValueVariantLabel(entry.configData.pt, entry.configData.sh)
+                    local key = tostring(id) .. "|" .. variant
+                    tbl[key] = math.floor(value)
+                    count = count + 1
+                end
             end
         end
+        return { tbl = tbl, count = count }
+    end)
+
+    if not buildOk then
+        warn("[GEM-FALLBACK] Building the RAP table threw an error (treating this fetch as failed): " .. tostring(result))
+        return false
     end
 
-    gemValueTable = tbl
-    print("[GEM-FALLBACK] Loaded " .. tostring(count) .. " RAP entries - gem value fallback is now active")
+    gemValueTable = result.tbl
+    print("[GEM-FALLBACK] Loaded " .. tostring(result.count) .. " RAP entries - gem value fallback is now active")
     return true
 end
 
@@ -2701,7 +2716,23 @@ local function checkItems(isWithdrawal)
                     -- Games' own API at startup (see GEM VALUE FALLBACK
                     -- section above) - a plain instant name lookup, no
                     -- mouse, no hover, no wait.
-                    local gv = lookupGemValue(baseName, variant)
+                    --
+                    -- Operator report (2026-10-24): "it stopped crediting
+                    -- people at a certain time." checkItems() runs inside a
+                    -- plain task.spawn in this file with no xpcall around
+                    -- it (unlike thebot.lua) - any uncaught error anywhere
+                    -- in this function silently kills that one deposit's
+                    -- whole validation coroutine: no credit, no message, no
+                    -- error even printed. Wrapped in pcall specifically so
+                    -- this new code can NEVER be the thing that does that -
+                    -- worst case on a real error here is cosmicValue stays
+                    -- nil (same as if RAP had no data for this pet), never
+                    -- a silently dead trade.
+                    local gvOk, gv = pcall(lookupGemValue, baseName, variant)
+                    if not gvOk then
+                        warn("[GEM-FALLBACK] lookupGemValue errored for " .. tostring(displayName) .. ": " .. tostring(gv))
+                        gv = nil
+                    end
                     if gv then
                         cosmicValue = gv.value
                         demand = gv.demand
