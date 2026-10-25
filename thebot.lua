@@ -15,8 +15,41 @@
 -- ============================================================
 -- CONFIGURATION (UPDATE THESE!)
 -- ============================================================
-local BOT_ID           = "98a5a262a479bd8203a8f5d9"
-local BOT_API_SECRET   = "3f0bf649661ee04db63e561fe0f4e5475e666cd73317df8e1ea892a0c69f0876"
+-- Operator request (2026-10-25, voice): "I'm not doing two different
+-- codes... it first sees which bot is running it on and then detects it
+-- like that." One shared script for every bot account now, not a separate
+-- file per bot - it reads which Roblox account it's actually logged into
+-- and picks that account's own BOT_ID/BOT_API_SECRET automatically.
+--
+-- To add another bot: create its login the same way as before (Admin ->
+-- Trading Bots -> Bot logins -> Create), then add ONE new row below with
+-- its exact Roblox username (case-sensitive) and the id/secret it just
+-- gave you. Nothing else in this file changes, and every other bot's row
+-- stays untouched.
+local BOT_CREDENTIALS_BY_USERNAME = {
+    ["ps99_flips123"] = {
+        id = "98a5a262a479bd8203a8f5d9",
+        secret = "3f0bf649661ee04db63e561fe0f4e5475e666cd73317df8e1ea892a0c69f0876",
+    },
+    ["lucifer_rafay"] = {
+        id = "ab4784d6ea2eb12d8f3db87e",
+        secret = "72a6842789af44122feed34a7dcd283e600c46464e8d7f54be88957387b09078",
+    },
+}
+
+-- Hard-errors instead of silently running with blank/wrong credentials -
+-- same "never silently guess" rule the rest of this file already follows
+-- for a misread item. If this fires, the account's username either isn't
+-- in the table above yet, or doesn't match it exactly (case-sensitive).
+local localAccountName = game:GetService("Players").LocalPlayer.Name
+local myBotCredentials = BOT_CREDENTIALS_BY_USERNAME[localAccountName]
+if not myBotCredentials then
+    error("[CONFIG] No BOT_ID/BOT_API_SECRET on file for the Roblox account '" ..
+        tostring(localAccountName) .. "' - add it to BOT_CREDENTIALS_BY_USERNAME at the top of this script.")
+end
+
+local BOT_ID           = myBotCredentials.id
+local BOT_API_SECRET   = myBotCredentials.secret
 local PRIVATE_SERVER_LINK = "https://www.roblox.com/share?code=ec02451b42e74946973aee7260ed4d80&type=Server"
 -- Base URL only. Do NOT append /api. The client adds /api/bots/... itself.
 local website          = "https://bloxyflip.fun"
@@ -4543,6 +4576,39 @@ task.spawn(function()
                     table.insert(snapshot, entry)
                 end
                 entry.quantity = entry.quantity + 1
+            end
+        end
+
+        -- Operator request (2026-10-25, voice): "scan [the bot's] own
+        -- inventory... multiple measures and see which one performs."
+        -- Attempts the SAME instant, no-UI CV-DIRECT table lookup a live
+        -- trade read already uses (readCosmicValueDirect) for every unique
+        -- item the bot is actually holding right now, not just ones
+        -- sitting in an open trade offer - a real, independent price
+        -- source the backend cross-checks/auto-corrects its own catalog
+        -- against (see depositService.ts's
+        -- reconcileCatalogWithTrustedCosmicRead), on top of whatever the
+        -- official Big Games API confirms.
+        --
+        -- itemSlot=nil is safe here: locateCosmicValueTable only ever
+        -- touches itemSlot when the table hasn't been located yet THIS
+        -- SESSION (it returns the already-cached table immediately
+        -- otherwise, itemSlot never read in that path) - so this only
+        -- actually produces a value once some earlier real trade this
+        -- session caused the table to be found; before that it cleanly
+        -- returns nil for every item here, identical to having no scan at
+        -- all. That's the "multiple measures" ask: if CV-DIRECT isn't
+        -- available this session (or at all, on an executor without
+        -- getconnections), these two fields are simply absent and the
+        -- backend already falls back to its own catalog price - nothing
+        -- here can make a heartbeat worse than it already was.
+        for _, entry in ipairs(snapshot) do
+            local gemOk, gemEntry = pcall(lookupGemValue, entry.petName, entry.variant)
+            local referenceValue = (gemOk and gemEntry and gemEntry.value) or nil
+            local cvOk, direct = pcall(readCosmicValueDirect, nil, entry.petName, entry.variant, referenceValue)
+            if cvOk and type(direct) == "table" and direct.value then
+                entry.cosmicValue = direct.value
+                entry.cosmicDemand = direct.demand
             end
         end
 
