@@ -859,6 +859,42 @@ local function cancelWithdrawalTrade(withdrawalData, reason, retry)
     return true
 end
 
+-- Operator report (2026-10-25, voice): "when I cancel the withdrawal,
+-- duplicates the pets... stop." Clicking cancel on the site while a
+-- withdrawal is already claimed (PROCESSING) only ever set a flag on the
+-- backend (WithdrawalRequest.cancelRequested) - it was always meant to be
+-- polled by whichever bot has the request, which backs out itself before
+-- touching anything physical (see withdrawals.routes.ts's own doc
+-- comment on that route). This script never checked that flag at all, so
+-- a cancel click during PROCESSING did nothing - the trade still
+-- completed and paid out exactly as if nothing had been clicked, while
+-- the player believed it was cancelled. A plain read, no state change -
+-- called once right after accepting the trade, before anything is added
+-- to it, so there's still a fully safe backout available if it comes
+-- back true.
+local function checkWithdrawalCancelled(withdrawalId)
+    if not withdrawalId then return false end
+
+    local s, r = makeAuthenticatedRequest(
+        "/api/bots/check-withdrawal-cancelled",
+        { withdrawalId = tostring(withdrawalId) },
+        "POST"
+    )
+
+    local data = decodeBody(r)
+
+    if not (s and r and r.StatusCode == 200 and data and data.success == true) then
+        warn(
+            "[WITHDRAWAL-CANCEL-CHECK] Failed to check cancel status | status=" ..
+            tostring(r and r.StatusCode or "?") ..
+            " - proceeding as not-cancelled rather than blocking a real withdrawal on a network blip"
+        )
+        return false
+    end
+
+    return data.cancelled == true
+end
+
 local function makeGetRequest(endpoint)
     return makeAuthenticatedRequest(endpoint, nil, "GET")
 end
@@ -3130,6 +3166,50 @@ local function withdrawalDisplayFromRequest(req)
     return nil
 end
 
+-- Real bug (operator report, 2026-10-25, voice: console confirmed via the
+-- site's own raw withdrawal data). withdrawalDisplayFromRequest above
+-- builds a PREFIX-styled name ("Rainbow Titanic Genie Fox") - correct for
+-- its OWN job (matching the real in-game trade window's own display
+-- convention, which genuinely is prefix-styled) but wrong for the ONE
+-- other thing this same string used to get used for: missingPets, sent
+-- straight to the backend's /complete-withdrawal. The backend's own
+-- WithdrawalItemPick.name is ALWAYS SUFFIX-styled ("Titanic Genie Fox
+-- (Rainbow)") - the same convention variantQualifiedName, BotHeldItemRow,
+-- and every other backend name already uses. A missing Golden/Rainbow/
+-- Shiny item reported under the wrong string never matched the backend's
+-- own stored pick name, so partiallyCompleteWithdrawal silently treated a
+-- genuinely undelivered item as if it had been fully delivered - closing
+-- the WHOLE withdrawal out as COMPLETED instead of keeping it open for
+-- another bot. Confirmed live: a Jejd544 withdrawal for Gargantuan Ornate
+-- Dragon + Gargantuan Wise Cat + Titanic Genie Fox (Rainbow) completed
+-- twice in a row, 6 minutes apart, for the exact same 3 items - the
+-- Rainbow one was never actually landing, every time.
+--
+-- This is a SEPARATE function, not a change to withdrawalDisplayFromRequest
+-- itself - that one stays exactly as-is for its own job (itemsGiven[].name,
+-- matched later against the real trade window's uiPets in
+-- handleTradeCompletion, which genuinely does need the prefix style).
+-- Only missingPets - the three call sites below - switch to this one.
+local function withdrawalBackendNameFromRequest(req)
+    local petId = tostring(req.petId or req.configName or "")
+    local variant = tostring(req.variant or "normal"):lower()
+    local entry = catalogByKey[petId .. "|" .. variant]
+    local baseName = (entry and entry.name) or req.petName
+    if not baseName then return nil end
+
+    local label = nil
+    if variant == "shiny_golden" then label = "Shiny Golden"
+    elseif variant == "shiny_rainbow" then label = "Shiny Rainbow"
+    elseif variant == "shiny" then label = "Shiny"
+    elseif variant == "golden" then label = "Golden"
+    elseif variant == "rainbow" then label = "Rainbow" end
+
+    if label then
+        return tostring(baseName) .. " (" .. label .. ")"
+    end
+    return tostring(baseName)
+end
+
 local function getStableWithdrawalInventory(requestedItems)
     local lastSignature = nil
     local stableCount = 0
@@ -3386,6 +3466,13 @@ local function addWithdrawalItems(withdrawalData)
             withdrawalDisplayFromRequest(req)
             or tostring(req.petName or petId)
 
+        -- Used ONLY for missingPets below - must match the backend's own
+        -- suffix-styled pick.name, never the prefix-styled displayName
+        -- above (see withdrawalBackendNameFromRequest's own doc comment).
+        local backendName =
+            withdrawalBackendNameFromRequest(req)
+            or displayName
+
         for quantityIndex = 1, quantity do
 
             if #itemsGiven >= MAX_TRADE_PETS then
@@ -3397,7 +3484,7 @@ local function addWithdrawalItems(withdrawalData)
                 for _ = 1, remainingCurrent do
                     table.insert(
                         missingPets,
-                        tostring(displayName)
+                        tostring(backendName)
                     )
                 end
 
@@ -3409,7 +3496,10 @@ local function addWithdrawalItems(withdrawalData)
                         requestedItems[remainingReqIndex]
 
                     local remainingName =
-                        withdrawalDisplayFromRequest(
+                        withdrawalBackendNameFromRequest(
+                            remainingReq
+                        )
+                        or withdrawalDisplayFromRequest(
                             remainingReq
                         )
                         or tostring(
@@ -3558,7 +3648,7 @@ local function addWithdrawalItems(withdrawalData)
             if not found then
                 table.insert(
                     missingPets,
-                    tostring(displayName)
+                    tostring(backendName)
                 )
 
                 print(
@@ -4315,26 +4405,6 @@ local function connectMessage(localId, tradeMethod)
         local startTime = tick()
         while (tick() - startTime) < TRADE_TIMEOUT_SECONDS and not goNext and tradeId == localId do
             task.wait(0.5)
-        end
-        -- Diagnostic (2026-10-25, operator report: deposits abandoning
-        -- within ~1 second of opening, well before TRADE_TIMEOUT_SECONDS,
-        -- with no player action possible in that window). tradeId/goNext
-        -- are shared globals, not scoped to this one trade attempt - this
-        -- watcher's own exit condition (tradeId == localId) can go false
-        -- not because THIS trade actually ended, but because some OTHER
-        -- code path wrote a different value into the same shared tradeId
-        -- variable while this trade was still legitimately in progress.
-        -- Logs exactly which condition actually caused the exit and the
-        -- real variable values at that instant, so the next real
-        -- occurrence proves the mechanism instead of staying a guess.
-        local elapsed = tick() - startTime
-        print(string.format(
-            "[MSG-WATCHDOG] Exited wait loop after %.2fs | localId=%s | tradeId(now)=%s | goNext=%s | tradeProcessed=%s | tradeCancelled=%s",
-            elapsed, tostring(localId), tostring(tradeId), tostring(goNext), tostring(tradeProcessed), tostring(tradeCancelled)
-        ))
-        if elapsed < TRADE_TIMEOUT_SECONDS - 1 and not goNext and tradeId ~= localId then
-            warn("[MSG-WATCHDOG] Exited early because tradeId changed out from under this trade (not a real end-of-trade event) - tradeId went from " ..
-                tostring(localId) .. " to " .. tostring(tradeId) .. " after only " .. string.format("%.2f", elapsed) .. "s")
         end
         if not tradeProcessed and not tradeCancelled and not goNext then
             warn("[MSG] Trade ended without success message - NOT processing to avoid incorrect trade")
@@ -5102,6 +5172,33 @@ task.spawn(function()
     lastGameTradeId = localId
 
     if localId then
+        if checkWithdrawalCancelled(withdrawalData.data.id) then
+            print(
+                "[WITHDRAWAL-CANCEL-CHECK] Player cancelled this withdrawal on the site - " ..
+                "backing out before adding anything | withdrawalId=" ..
+                tostring(withdrawalData.data.id)
+            )
+
+            sendMessage("Withdrawal was cancelled on the site - nothing sent.")
+
+            cancelWithdrawalTrade(
+                withdrawalData.data,
+                "Player cancelled on site before bot added anything",
+                true
+            )
+
+            declineTrade()
+
+            goNext = true
+            tradeId = 0
+            lastGameTradeId = nil
+            method = nil
+            releaseIncomingTradeLock()
+            resetTradeState()
+
+            continue
+        end
+
         sendMessage("== WITHDRAWAL MODE ==")
         sendMessage("Bot is sending you your items.")
         sendDiscord("Withdrawal started: " .. username, 16776960)
