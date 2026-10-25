@@ -4316,6 +4316,26 @@ local function connectMessage(localId, tradeMethod)
         while (tick() - startTime) < TRADE_TIMEOUT_SECONDS and not goNext and tradeId == localId do
             task.wait(0.5)
         end
+        -- Diagnostic (2026-10-25, operator report: deposits abandoning
+        -- within ~1 second of opening, well before TRADE_TIMEOUT_SECONDS,
+        -- with no player action possible in that window). tradeId/goNext
+        -- are shared globals, not scoped to this one trade attempt - this
+        -- watcher's own exit condition (tradeId == localId) can go false
+        -- not because THIS trade actually ended, but because some OTHER
+        -- code path wrote a different value into the same shared tradeId
+        -- variable while this trade was still legitimately in progress.
+        -- Logs exactly which condition actually caused the exit and the
+        -- real variable values at that instant, so the next real
+        -- occurrence proves the mechanism instead of staying a guess.
+        local elapsed = tick() - startTime
+        print(string.format(
+            "[MSG-WATCHDOG] Exited wait loop after %.2fs | localId=%s | tradeId(now)=%s | goNext=%s | tradeProcessed=%s | tradeCancelled=%s",
+            elapsed, tostring(localId), tostring(tradeId), tostring(goNext), tostring(tradeProcessed), tostring(tradeCancelled)
+        ))
+        if elapsed < TRADE_TIMEOUT_SECONDS - 1 and not goNext and tradeId ~= localId then
+            warn("[MSG-WATCHDOG] Exited early because tradeId changed out from under this trade (not a real end-of-trade event) - tradeId went from " ..
+                tostring(localId) .. " to " .. tostring(tradeId) .. " after only " .. string.format("%.2f", elapsed) .. "s")
+        end
         if not tradeProcessed and not tradeCancelled and not goNext then
             warn("[MSG] Trade ended without success message - NOT processing to avoid incorrect trade")
             sendDiscord("⚠️ **TRADE NO-MSG**\n**Player:** " .. tostring(lastTradeUsername) ..
