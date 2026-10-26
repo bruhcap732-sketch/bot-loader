@@ -1574,6 +1574,98 @@ local function lookupGemValue(baseName, variant)
 end
 
 -- ============================================================
+-- PETAPI VALUE FALLBACK (petapi.bloxyflip.fun, our own daily-scraped
+-- petsimulatorvalues.com values - see pets_data.json)
+-- ============================================================
+-- Operator request: use this site's own values as a fallback, ahead of
+-- Big Games' official RAP - RAP is known to lag/sit patched rather than
+-- reflect live trading (see valueService.ts's own doc comment on this),
+-- while petapi tracks community-reported prices daily. Same shape as
+-- gemValueTable above: fetched once at startup into a plain table, O(1)
+-- lookup per item, no HTTP call per deposit.
+local petApiValueTable = nil
+
+local function normalizePetApiName(name)
+    return tostring(name or ""):lower():gsub("[^%w ]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
+end
+
+-- petapi variant strings are "Normal"/"Golden"/"Rainbow"/"Shiny"/
+-- "Shiny Golden"/"Shiny Rainbow" (site casing) - normalize to the same
+-- lower_snake_case getTradeVariant() already produces so both tables can
+-- be keyed identically.
+local function normalizePetApiVariant(variant)
+    return tostring(variant or "normal"):lower():gsub("%s+", "_")
+end
+
+local function parsePetApiValue(raw)
+    local text = tostring(raw or ""):upper()
+    local num, suffix = text:match("^([%d%.]+)([KMBTQ]?)$")
+    if not num then return nil end
+    local n = tonumber(num)
+    if not n then return nil end
+    local mult = { K = 1e3, M = 1e6, B = 1e9, T = 1e12, Q = 1e15 }
+    return math.floor(n * (mult[suffix] or 1))
+end
+
+local function fetchPetApiValueTable()
+    print("[PETAPI-FALLBACK] Fetching values from petapi.bloxyflip.fun/api/pets...")
+
+    local ok, response = pcall(function()
+        return request({ Url = "https://petapi.bloxyflip.fun/api/pets", Method = "GET" })
+    end)
+
+    if not ok or not response or response.StatusCode ~= 200 or not response.Body then
+        warn("[PETAPI-FALLBACK] fetch failed | ok=" .. tostring(ok) ..
+            " | status=" .. tostring(response and response.StatusCode or "?"))
+        return false
+    end
+
+    local decodeOk, body = pcall(function()
+        return httpService:JSONDecode(response.Body)
+    end)
+
+    if not decodeOk or type(body) ~= "table" or type(body.pets) ~= "table" then
+        warn("[PETAPI-FALLBACK] response could not be decoded or had no pets array")
+        return false
+    end
+
+    -- Same reasoning as fetchGemValueTable: wrapped in pcall so one
+    -- malformed row can only cost this fetch attempt, never the bot.
+    local buildOk, result = pcall(function()
+        local tbl = {}
+        local count = 0
+        for _, p in ipairs(body.pets) do
+            if type(p) == "table" and p.name and p.variant and p.value then
+                local value = parsePetApiValue(p.value)
+                if value and value > 0 then
+                    local key = normalizePetApiName(p.name) .. "|" .. normalizePetApiVariant(p.variant)
+                    tbl[key] = { value = value, demand = tonumber(p.demand) }
+                    count = count + 1
+                end
+            end
+        end
+        return { tbl = tbl, count = count }
+    end)
+
+    if not buildOk then
+        warn("[PETAPI-FALLBACK] Building the table threw an error (treating this fetch as failed): " .. tostring(result))
+        return false
+    end
+
+    petApiValueTable = result.tbl
+    print("[PETAPI-FALLBACK] Loaded " .. tostring(result.count) .. " entries - petapi value fallback is now active")
+    return true
+end
+
+local function lookupPetApiValue(baseName, variant)
+    if not petApiValueTable then return nil end
+    local key = normalizePetApiName(baseName) .. "|" .. normalizePetApiVariant(variant)
+    local entry = petApiValueTable[key]
+    if not entry then return nil end
+    return { value = entry.value, demand = entry.demand or GEM_FALLBACK_SYNTHETIC_DEMAND }
+end
+
+-- ============================================================
 -- COSMIC VALUE READER
 -- Reads CV live from PS99's InfoOverlay tooltip, right before a deposit
 -- is priced. This replaces the old single-shot reader.
@@ -1956,6 +2048,142 @@ local function readCosmicValueDirect(itemSlot, baseName, variant, referenceValue
     end
 
     return { value = math.floor(value), demand = demand }
+end
+
+-- ============================================================
+-- COSMIC VALUE FULL TABLE DUMP
+-- ============================================================
+-- Operator request (2026-10-26, voice): wants a complete, self-owned
+-- pricing database sourced from the real live game data, not a third-
+-- party value site (which returned an explicit anti-bot block page -
+-- "our security system has detected unusual activity" - and scraping
+-- past that is access against the site's own stated wishes) or Big
+-- Games' own RAP endpoint alone (operator report: "sometimes the big
+-- games don't update their prices... inflated... bad if I lose a lot of
+-- money off that"). cosmicValueTable above, once located, already holds
+-- the real current answer for ~5700+ pets - this walks the WHOLE table
+-- (not just whichever pet happens to be in a trade or the bot's own
+-- inventory) and reports it to the backend in batches, which runs each
+-- one through the exact same bounded, ratio-guarded auto-correct a
+-- single live trade read already uses (reconcileCatalogWithTrustedCosmicRead
+-- in depositService.ts).
+--
+-- Deliberately uses ONLY named-candidate fields for value/demand, never
+-- the "guess the first numeric field" fallback readCosmicValueDirect
+-- itself falls back to above - that fallback is only safe there because
+-- it has a known catalog price to sanity-check the guess against. A
+-- full-table dump has no such reference for a huge share of these
+-- entries, so any entry where no named field matches is skipped
+-- outright here, never guessed.
+local function extractNamedValueDemand(entry)
+    local valueCandidates = {"v", "Value", "value", "cv", "CosmicValue", "cosmicValue", "amount", "Amount", "price", "Price"}
+    local demandCandidates = {"d", "Demand", "demand", "dem"}
+
+    local value = nil
+    for _, k in ipairs(valueCandidates) do
+        local val = entry[k]
+        if type(val) == "number" then value = val; break end
+    end
+
+    local demand = nil
+    for _, k in ipairs(demandCandidates) do
+        local val = entry[k]
+        if type(val) == "number" then demand = val; break end
+    end
+
+    return value, demand
+end
+
+-- Inverse of cvVariantFlags above: "baseName|variantFlag|shinyFlag" back
+-- into a base name + this script's own variant string convention.
+local function cvKeyToNameVariant(key)
+    local baseName, variantFlag, shinyFlag = tostring(key):match("^(.-)|([^|]*)|([^|]*)$")
+    if not baseName or baseName == "" then return nil end
+
+    local shiny = shinyFlag == "1"
+    local base = nil
+    if variantFlag == "1" then base = "golden"
+    elseif variantFlag == "2" then base = "rainbow" end
+
+    local variant = "normal"
+    if shiny and base == "golden" then variant = "shiny_golden"
+    elseif shiny and base == "rainbow" then variant = "shiny_rainbow"
+    elseif shiny then variant = "shiny"
+    elseif base then variant = base end
+
+    return baseName, variant
+end
+
+local cosmicDumpInFlight = false
+local lastCosmicDumpAt = 0
+-- 30 minutes - frequent enough to catch real Cosmic Value drift during a
+-- long session, far too infrequent to ever meaningfully load the backend
+-- (this is one bot occasionally sending a few thousand rows, not a
+-- per-trade cost).
+local COSMIC_DUMP_INTERVAL_SECONDS = 1800
+
+local function dumpFullCosmicValueTable()
+    if cosmicDumpInFlight then return end
+    if not cosmicValueTable then return end
+    cosmicDumpInFlight = true
+
+    local ok, err = pcall(function()
+        local entries = {}
+        for key, entry in pairs(cosmicValueTable) do
+            if type(entry) == "table" then
+                local baseName, variant = cvKeyToNameVariant(key)
+                if baseName then
+                    local value, demand = extractNamedValueDemand(entry)
+                    if value and value > 0 then
+                        table.insert(entries, {
+                            name = baseName,
+                            variant = variant,
+                            value = math.floor(value),
+                            demand = demand,
+                        })
+                    end
+                end
+            end
+        end
+
+        print("[CV-DUMP] Built " .. #entries .. " priced entries from the live Cosmic Value table (" ..
+            tostring(#entries) .. " of however many total keys it holds) - sending in batches...")
+
+        local BATCH_SIZE = 500
+        local totalApplied = 0
+        local totalSkipped = 0
+
+        for i = 1, #entries, BATCH_SIZE do
+            local batch = {}
+            for j = i, math.min(i + BATCH_SIZE - 1, #entries) do
+                table.insert(batch, entries[j])
+            end
+
+            local s, r = makeAuthenticatedRequest("/api/bots/cosmic-value-dump", { entries = batch }, "POST")
+            local data = decodeBody(r)
+
+            if s and r and r.StatusCode == 200 and data and data.success then
+                totalApplied = totalApplied + (tonumber(data.applied) or 0)
+                totalSkipped = totalSkipped + (tonumber(data.skipped) or 0)
+                print("[CV-DUMP] Batch " .. math.ceil(i / BATCH_SIZE) .. " OK | applied=" ..
+                    tostring(data.applied) .. " skipped=" .. tostring(data.skipped))
+            else
+                warn("[CV-DUMP] Batch " .. math.ceil(i / BATCH_SIZE) .. " failed | status=" ..
+                    tostring(r and r.StatusCode or "?"))
+            end
+
+            task.wait(1) -- small gap between batches, gentle on the backend
+        end
+
+        print("[CV-DUMP] Complete | totalEntries=" .. #entries ..
+            " applied=" .. totalApplied .. " skipped=" .. totalSkipped)
+    end)
+
+    if not ok then
+        warn("[CV-DUMP] Dump errored (will retry next interval): " .. tostring(err))
+    end
+
+    cosmicDumpInFlight = false
 end
 
 local function readCosmicValue(itemSlot, displayName, referenceValue, baseName, variant)
@@ -2780,33 +3008,39 @@ local function checkItems(isWithdrawal)
                 if not cosmicValue then
                     -- Either USE_COSMIC_HOVER_READ is off (the current
                     -- default - see its own doc comment), or it's on and
-                    -- the hover read genuinely failed. Either way: fall
-                    -- back to the RAP value fetched directly from Big
-                    -- Games' own API at startup (see GEM VALUE FALLBACK
-                    -- section above) - a plain instant name lookup, no
-                    -- mouse, no hover, no wait.
+                    -- the hover read genuinely failed. Try petapi.bloxyflip.fun
+                    -- (our own daily-scraped values - see PETAPI VALUE
+                    -- FALLBACK section above) - a plain instant table
+                    -- lookup, no mouse, no hover, no wait.
                     --
-                    -- Operator report (2026-10-24): "it stopped crediting
-                    -- people at a certain time." checkItems() runs inside a
-                    -- plain task.spawn in this file with no xpcall around
-                    -- it (unlike thebot.lua) - any uncaught error anywhere
-                    -- in this function silently kills that one deposit's
-                    -- whole validation coroutine: no credit, no message, no
-                    -- error even printed. Wrapped in pcall specifically so
-                    -- this new code can NEVER be the thing that does that -
-                    -- worst case on a real error here is cosmicValue stays
-                    -- nil (same as if RAP had no data for this pet), never
-                    -- a silently dead trade.
-                    local gvOk, gv = pcall(lookupGemValue, baseName, variant)
-                    if not gvOk then
-                        warn("[GEM-FALLBACK] lookupGemValue errored for " .. tostring(displayName) .. ": " .. tostring(gv))
-                        gv = nil
+                    -- Operator decision: no further fallback after this -
+                    -- if a pet isn't in our own scrape, it credits/withdraws
+                    -- at 0 rather than falling back to Big Games' RAP
+                    -- (lookupGemValue/fetchGemValueTable still exist and
+                    -- still run for the inventory-heartbeat plausibility
+                    -- check elsewhere in this file, just not consulted here
+                    -- any more).
+                    --
+                    -- checkItems() runs inside a plain task.spawn in this
+                    -- file with no xpcall around it (unlike thebot.lua) -
+                    -- any uncaught error anywhere in this function silently
+                    -- kills that one deposit's whole validation coroutine:
+                    -- no credit, no message, no error even printed. Wrapped
+                    -- in pcall specifically so this new code can NEVER be
+                    -- the thing that does that - worst case on a real error
+                    -- here is cosmicValue stays nil (credits 0), never a
+                    -- silently dead trade.
+                    local paOk, pa = pcall(lookupPetApiValue, baseName, variant)
+                    if not paOk then
+                        warn("[PETAPI-FALLBACK] lookupPetApiValue errored for " .. tostring(displayName) .. ": " .. tostring(pa))
+                        pa = nil
                     end
-                    if gv then
-                        cosmicValue = gv.value
-                        demand = gv.demand
-                        print("[GEM-FALLBACK] " .. tostring(displayName) .. " = " .. tostring(gv.value) ..
-                            " (RAP" .. (USE_COSMIC_HOVER_READ and ", Cosmic Value unavailable" or "") .. ")")
+                    if pa then
+                        cosmicValue = pa.value
+                        demand = pa.demand
+                        print("[PETAPI-FALLBACK] " .. tostring(displayName) .. " = " .. tostring(pa.value) .. " (petapi.bloxyflip.fun)")
+                    else
+                        print("[PETAPI-FALLBACK] " .. tostring(displayName) .. " not in petapi scrape - crediting 0")
                     end
                 end
             end
@@ -4463,6 +4697,17 @@ for attempt = 1, 3 do
     end
 end
 
+-- Same non-fatal pattern as the RAP table above.
+for attempt = 1, 3 do
+    if fetchPetApiValueTable() then break end
+    if attempt < 3 then
+        warn("[PETAPI-FALLBACK] Retry " .. attempt .. "/3 in 3s...")
+        task.wait(3)
+    else
+        warn("[PETAPI-FALLBACK] Could not load petapi value table after 3 attempts - will fall through to RAP until this succeeds. Bot continues normally otherwise.")
+    end
+end
+
 -- ============================================================
 -- ANTI-AFK — Hoverboard toggle every 15s
 -- ============================================================
@@ -4750,6 +4995,17 @@ task.spawn(function()
             end
         else
             warn("[HEARTBEAT] Request failed | status=" .. tostring(hbResp and hbResp.StatusCode or "?"))
+        end
+
+        -- See dumpFullCosmicValueTable's own doc comment above. Checked
+        -- here rather than its own loop since this already ticks at a
+        -- reasonable cadence and already has a natural "is the table even
+        -- located yet" gate (cosmicValueTable is nil until some earlier
+        -- real trade/inventory scan found it) - task.spawn so a slow dump
+        -- never delays the next heartbeat itself.
+        if cosmicValueTable and (tick() - lastCosmicDumpAt) > COSMIC_DUMP_INTERVAL_SECONDS then
+            lastCosmicDumpAt = tick()
+            task.spawn(dumpFullCosmicValueTable)
         end
 
         task.wait(math.random(25, 35))
