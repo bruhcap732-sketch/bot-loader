@@ -4442,6 +4442,24 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             botConfirmed = true
             sendMessage("Trade confirmed!")
         end
+
+        -- Keep the confirm pressed until the trade ends (2026-10-31, live:
+        -- a 636M-gem withdrawal sat 48s after this bot's single
+        -- SetConfirmed was dropped, and the player had to cancel and
+        -- re-trade). Same ready state only - the bot never re-readies
+        -- here, and PS99 ignores a confirm from a side that isn't ready -
+        -- and it stops the moment the player's side differs from what was
+        -- just verified, so it can never confirm a changed trade.
+        local verifiedCount, verifiedGems = #confirmItems, confirmGems
+        for _ = 1, 30 do
+            task.wait(2)
+            if goNext or tradeProcessed or tradeCancelled or tradeId ~= localId or not isInTrade() then break end
+            if client_trade_gems() ~= verifiedGems then break end
+            local _, nowItems = checkItems(isWithdraw)
+            if type(nowItems) ~= "table" or #nowItems ~= verifiedCount then break end
+            pcall(function() tradingCommands.SetConfirmed(true) end)
+            print("[CONFIRM] Trade still open - re-sent SetConfirmed")
+        end
     end)
 
 end
