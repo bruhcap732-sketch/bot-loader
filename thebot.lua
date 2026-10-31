@@ -4580,6 +4580,23 @@ local function connectStatus(localId, tradeMethod)
                         task.wait(1)
                     else
                         local depositGems = client_trade_gems()
+
+                        -- Gem cap (operator, 2026-10-31): PS99 caps an
+                        -- account's gems, so never take a gem deposit that
+                        -- would put this bot over 995B. Pets-only is fine.
+                        local BOT_GEM_LIMIT = 995000000000
+                        if depositGems > 0 and (getBotGemBalance() + depositGems) > BOT_GEM_LIMIT then
+                            warn("[GEM-CAP] Deposit of " .. tostring(depositGems) .. " gems would put the bot over 995B - cancelling")
+                            sendMessage("This bot is full on gems (995B max). Deposit pets instead, or trade the other bot.")
+                            tradeCancelled = true
+                            tradeProcessed = true
+                            declineTrade()
+                            goNext = true
+                            releaseIncomingTradeLock()
+                            resetTradeState()
+                            return
+                        end
+
                         lastTradeItems = output
                         lastTradeGems  = depositGems
                         hasReadied     = true
