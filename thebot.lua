@@ -3299,6 +3299,29 @@ local function getHugesTitanics(requestedItems)
         return results
     end
 
+    -- Requested ids/names normalized once per scan, not once per pet per
+    -- request (2026-10-31 speed fix: ~1,200 pets x up to 100 requested
+    -- entries on every scan). Same rule as before.
+    local requestedIdSet, requestedNameSet = {}, {}
+    if type(requestedItems) == "table" then
+        for _, req in ipairs(requestedItems) do
+            local reqId = normalizeWithdrawalInventoryText(req.petId or req.configName)
+            local reqName = normalizeWithdrawalInventoryText(req.petName)
+            if reqName == "" and reqId ~= "" then
+                local entry = catalogByKey[
+                    tostring(req.petId or req.configName)
+                        .. "|"
+                        .. tostring(req.variant or "normal"):lower()
+                ]
+                if entry and entry.name then
+                    reqName = normalizeWithdrawalInventoryText(entry.name)
+                end
+            end
+            if reqId ~= "" then requestedIdSet[reqId] = true end
+            if reqName ~= "" then requestedNameSet[reqName] = true end
+        end
+    end
+
     local function addInventoryPet(uuid, pet)
         if uuid == nil or pet == nil then
             return
@@ -3325,34 +3348,8 @@ local function getHugesTitanics(requestedItems)
         local isGargantuan = idNorm:find("gargantuan", 1, true) ~= nil
             or nameNorm:find("gargantuan", 1, true) ~= nil
 
-        local isExplicitlyRequested = false
-
-        if type(requestedItems) == "table" then
-            for _, req in ipairs(requestedItems) do
-                local reqId = normalizeWithdrawalInventoryText(
-                    req.petId or req.configName
-                )
-                local reqName = normalizeWithdrawalInventoryText(req.petName)
-
-                if reqName == "" and reqId ~= "" then
-                    local entry = catalogByKey[
-                        tostring(req.petId or req.configName)
-                            .. "|"
-                            .. tostring(req.variant or "normal"):lower()
-                    ]
-                    if entry and entry.name then
-                        reqName = normalizeWithdrawalInventoryText(entry.name)
-                    end
-                end
-
-                if (reqId ~= "" and idNorm == reqId)
-                    or (reqName ~= "" and nameNorm == reqName)
-                then
-                    isExplicitlyRequested = true
-                    break
-                end
-            end
-        end
+        local isExplicitlyRequested = (idNorm ~= "" and requestedIdSet[idNorm] == true)
+            or (nameNorm ~= "" and requestedNameSet[nameNorm] == true)
 
         if isHuge or isTitanic or isGargantuan or isExplicitlyRequested then
             seen[uuidStr] = true
@@ -3517,6 +3514,24 @@ local function getStableWithdrawalInventory(requestedItems)
             return true
         end
 
+        -- Indexed once per check (2026-10-31 speed fix) instead of
+        -- rescanning every pet for every requested entry. Same rule: id or
+        -- name match, plus exact variant.
+        local index = {}
+        local function addTo(key, pet)
+            local bucket = index[key]
+            if not bucket then
+                bucket = {}
+                index[key] = bucket
+            end
+            bucket[#bucket + 1] = pet
+        end
+        for _, pet in ipairs(list) do
+            local petVariant = normalize(tostring(pet.variant or "normal"))
+            addTo(petVariant .. "|id|" .. normalize(pet.id), pet)
+            addTo(petVariant .. "|name|" .. normalize(pet.name or getNameById(pet.id)), pet)
+        end
+
         for _, req in ipairs(requestedItems) do
             local requestedId = normalize(req.petId or req.configName)
             local requestedName = normalize(req.petName)
@@ -3538,26 +3553,18 @@ local function getStableWithdrawalInventory(requestedItems)
             local quantity = math.max(1, tonumber(req.quantity or 1) or 1)
             local found = 0
 
-            for _, pet in ipairs(list) do
-                local petVariant = normalize(tostring(pet.variant or "normal"))
-                local petName = normalize(pet.name or getNameById(pet.id))
-                local petId = normalize(pet.id)
-
-                local idMatch =
-                    requestedId ~= "" and petId == requestedId
-
-                local nameMatch =
-                    requestedName ~= "" and petName == requestedName
-
-                if (idMatch or nameMatch)
-                    and petVariant == requestedVariant
-                then
-                    found = found + 1
-                    if found >= quantity then
-                        break
+            local seenPet = {}
+            local function countFrom(key)
+                for _, pet in ipairs(index[key] or {}) do
+                    if found >= quantity then return end
+                    if not seenPet[pet] then
+                        seenPet[pet] = true
+                        found = found + 1
                     end
                 end
             end
+            if requestedId ~= "" then countFrom(requestedVariant .. "|id|" .. requestedId) end
+            if requestedName ~= "" then countFrom(requestedVariant .. "|name|" .. requestedName) end
 
             if found < quantity then
                 return false
@@ -3721,6 +3728,60 @@ local function addWithdrawalItems(withdrawalData)
         return false
     end
 
+    -- One index over the bot's pets, built once per withdrawal (2026-10-31,
+    -- operator: a 100-pet withdrawal "takes long"). The loop below used to
+    -- run petMatches over the WHOLE inventory twice for every requested
+    -- unit - 100 units x ~1,200 pets x 2. Same match rule (exact id, or
+    -- exact name, plus exact variant) and the same inventory order - just
+    -- looked up instead of rescanned.
+    local petIndex, petOrder = {}, {}
+    local function indexPet(key, b)
+        local bucket = petIndex[key]
+        if not bucket then
+            bucket = {}
+            petIndex[key] = bucket
+        end
+        bucket[#bucket + 1] = b
+    end
+    for i, b in ipairs(botHuges) do
+        petOrder[b] = i
+        local v = tostring(b.variant or getBotVariant(b) or "normal"):lower()
+        if v == "gold" then v = "golden" end
+        if v == "rb" then v = "rainbow" end
+        local idKey = normalizeText(b.id)
+        if idKey ~= "" then
+            indexPet(v .. "|id|" .. idKey, b)
+        end
+        local nameKey = normalizeText(b.name or getNameById(b.id))
+        if nameKey ~= "" and nameKey ~= "???" then
+            indexPet(v .. "|name|" .. nameKey, b)
+        end
+    end
+
+    local function candidatesFor(req, requestedVariant)
+        local requestedId = normalizeText(req.petId or req.configName)
+        local expectedName = normalizeText(req.petName or "")
+        if expectedName == "" and requestedId ~= "" then
+            local entry = catalogByKey[tostring(req.petId or req.configName) .. "|" .. requestedVariant]
+            if entry and entry.name then
+                expectedName = normalizeText(entry.name)
+            end
+        end
+        local out, seen = {}, {}
+        local function addAll(list)
+            for _, b in ipairs(list or {}) do
+                if not seen[b] then
+                    seen[b] = true
+                    out[#out + 1] = b
+                end
+            end
+        end
+        if requestedId ~= "" then addAll(petIndex[requestedVariant .. "|id|" .. requestedId]) end
+        if expectedName ~= "" then addAll(petIndex[requestedVariant .. "|name|" .. expectedName]) end
+        table.sort(out, function(a, b) return petOrder[a] < petOrder[b] end)
+        return out
+    end
+
     local petLimitReached = false
 
     for reqIndex, req in ipairs(requestedItems) do
@@ -3751,6 +3812,8 @@ local function addWithdrawalItems(withdrawalData)
         local backendName =
             withdrawalBackendNameFromRequest(req)
             or displayName
+
+        local reqCandidates = candidatesFor(req, requestedVariant)
 
         for quantityIndex = 1, quantity do
 
@@ -3817,8 +3880,8 @@ local function addWithdrawalItems(withdrawalData)
             local matchingCandidatesTried = 0
 
             local debugMatches = 0
-            for _, dbgPet in ipairs(botHuges) do
-                if petMatches(dbgPet, req, displayName, requestedVariant) then
+            for _, dbgPet in ipairs(quantityIndex == 1 and reqCandidates or {}) do
+                do
                     debugMatches = debugMatches + 1
                     if debugMatches <= 3 then
                         print("[WITHDRAWAL-DIAG] MATCHABLE INVENTORY PET #" ..
@@ -3831,19 +3894,15 @@ local function addWithdrawalItems(withdrawalData)
                     end
                 end
             end
-            print("[WITHDRAWAL-DIAG] Requested '" .. tostring(displayName) ..
-                "' | variant=" .. tostring(requestedVariant) ..
-                " | matchableCount=" .. tostring(debugMatches))
+            if quantityIndex == 1 then
+                print("[WITHDRAWAL-DIAG] Requested '" .. tostring(displayName) ..
+                    "' | variant=" .. tostring(requestedVariant) ..
+                    " | matchableCount=" .. tostring(#reqCandidates))
+            end
             local MAX_MATCHING_CANDIDATES_PER_REQUEST = 2
 
-            for _, b in ipairs(botHuges) do
+            for _, b in ipairs(reqCandidates) do
                 if not usedUUIDs[b.uuid]
-                    and petMatches(
-                        b,
-                        req,
-                        displayName,
-                        requestedVariant
-                    )
                 then
                     matchingCandidatesTried = matchingCandidatesTried + 1
 
