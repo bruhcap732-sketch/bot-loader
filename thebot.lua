@@ -219,6 +219,11 @@ local lastTradeGems      = 0
 local lastWithdrawalData = nil
 local lastItemsGiven     = {}
 local lastBotGemsAdded   = 0  -- gems bot actually sent (derived from botGemBalance, not UI)
+-- What the bot's own inventory held of each pet it put into the current
+-- withdrawal trade (UUID -> units) and its gem balance, read right after
+-- adding them, plus a busy flag - see settleUnconfirmedWithdrawal. One
+-- table: the main chunk is close to Luau's 200-local limit.
+local withdrawalSettle = { unitsBefore = {}, gemsBefore = nil, busy = false, depositGemsBefore = nil, depositCountBefore = nil }
 local botGemBalance      = 0  -- latest backend-held gem balance
 local botGemBalancePresent = false -- true once heartbeat supplies a valid heldGemsBalance
 local lastGemsRequested  = 0  -- what we asked the game to add (reliable even after window closes)
@@ -283,6 +288,10 @@ local function resetTradeState()
     lastWithdrawalData    = nil
     lastItemsGiven        = {}
     lastBotGemsAdded      = 0
+    withdrawalSettle.unitsBefore = {}
+    withdrawalSettle.gemsBefore  = nil
+    withdrawalSettle.depositGemsBefore  = nil
+    withdrawalSettle.depositCountBefore = nil
     lastGemsRequested     = 0
     lastWithdrawalMissing = { pets = {}, gems = 0 }
     tradeProcessed        = false
@@ -3212,32 +3221,68 @@ local function normalizeWithdrawalInventoryText(v)
         :gsub("%s+$", "")
 end
 
-local function getHugesTitanics(requestedItems)
-    local saveData = nil
+local readInventoryPetTable, petUnitCount
+do
+-- The live save table, or nil. Same getters getHugesTitanics always used.
+local function readSaveData()
+    if type(saveModule) ~= "table" then
+        return nil
+    end
+    local getters = {
+        function() return saveModule.Get() end,
+        function() return saveModule:Get() end,
+        function() return saveModule.GetData() end,
+        function() return saveModule:GetData() end,
+        function() return saveModule.Data end,
+        function() return saveModule.SaveData end,
+        function() return saveModule.PlayerData end,
+    }
+    for _, getter in ipairs(getters) do
+        local ok, result = pcall(getter)
+        if ok and type(result) == "table" then
+            return result
+        end
+    end
+    return nil
+end
 
-    if type(saveModule) == "table" then
-        local getters = {
-            function() return saveModule.Get() end,
-            function() return saveModule:Get() end,
-            function() return saveModule.GetData() end,
-            function() return saveModule:GetData() end,
-            function() return saveModule.Data end,
-            function() return saveModule.SaveData end,
-            function() return saveModule.PlayerData end,
-        }
-
-        for _, getter in ipairs(getters) do
-            local ok, result = pcall(getter)
-            if ok and type(result) == "table" then
-                saveData = result
-                break
+-- Inventory.Pet (UUID -> save record), or nil when it can't be read.
+-- 2026-10-31 (operator: a withdrawal "didn't work until I rejoined"): when
+-- it comes back missing, re-require Save right here instead of waiting on
+-- MODULE-STALENESS-WATCHDOG, which only acts every 60s and only when the
+-- ModuleScript instance itself changed.
+function readInventoryPetTable()
+    local saveData = readSaveData()
+    local pets = saveData and type(saveData.Inventory) == "table" and saveData.Inventory.Pet
+    if type(pets) == "table" then
+        return pets, saveData
+    end
+    local fresh = clientFolder and clientFolder:FindFirstChild("Save")
+    if fresh then
+        local reloaded = tryRequireModule(fresh, "Save")
+        if type(reloaded) == "table" then
+            saveModuleScript = fresh
+            saveModule = reloaded
+            saveData = readSaveData()
+            pets = saveData and type(saveData.Inventory) == "table" and saveData.Inventory.Pet
+            if type(pets) == "table" then
+                print("[BOT] Inventory.Pet was unreadable - Save re-required and it reads again")
+                return pets, saveData
             end
         end
     end
+    return nil, saveData
+end
 
-    local inventoryPets = saveData
-        and saveData.Inventory
-        and saveData.Inventory.Pet
+-- Units in one save record (ordinary pets stack under one UUID with _am).
+function petUnitCount(record)
+    local amount = tonumber(withdrawalReadField(record, "_am", "am", "amount"))
+    return (amount and amount > 0) and amount or 1
+end
+end
+
+local function getHugesTitanics(requestedItems)
+    local inventoryPets, saveData = readInventoryPetTable()
 
     local results = {}
     local seen = {}
@@ -4363,6 +4408,13 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
 
         lastTradeItems = confirmItems
         lastTradeGems  = confirmGems
+        if tradeMethod == "deposit" then
+            local okG, bal = pcall(getBotGemBalance)
+            -- getBotGemBalance returns 0 when it can't read, so 0 = unknown.
+            withdrawalSettle.depositGemsBefore = (okG and type(bal) == "number" and bal > 0) and bal or nil
+            local okI, inv = pcall(getHugesTitanics)
+            withdrawalSettle.depositCountBefore = (okI and type(inv) == "table") and #inv or nil
+        end
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
 
         pcall(function() tradingCommands.SetConfirmed(true) end)
@@ -4575,12 +4627,232 @@ local function connectStatus(localId, tradeMethod)
 end
 
 -- ============================================================
+-- UNCONFIRMED WITHDRAWALS
+-- ============================================================
+-- Real dupe (operator report, 2026-10-31: "there was a dupe on the bot...
+-- only when I interfere or when the bot lags"; next trade failed with "No
+-- requested withdrawal items were available: Huge Gingerbread Lion
+-- (Rainbow), ..."). Every way a withdrawal trade could end WITHOUT PS99's
+-- success popup - no popup, the 120s timeout - refunded the request
+-- outright. Under lag the popup is exactly what goes missing while the
+-- trade itself still goes through, so the player got the pets in game AND
+-- back on the site, and the re-queued request then found nothing to send.
+--
+-- The bot's own inventory settles it instead of a guess: the pets it put
+-- in the trade (by UUID) are either still there - nothing left, refunding
+-- is safe - or gone - it was delivered, confirm it like a normal success.
+-- PS99 trades are all-or-nothing, so anything in between, or an
+-- unreadable inventory, is HELD for an admin (Approve if it went through,
+-- Reject to refund) rather than refunded on a guess.
+local settleUnconfirmedWithdrawal
+do
+local function holdWithdrawalForReview(withdrawalData, reason)
+    if not withdrawalData or not withdrawalData.id then
+        return false
+    end
+    local s, r = makeAuthenticatedRequest(
+        "/api/bots/hold-withdrawal-for-review",
+        { withdrawalId = tostring(withdrawalData.id), reason = tostring(reason or "Unclear"):sub(1, 400) },
+        "POST"
+    )
+    local data = decodeBody(r)
+    local ok = s and r and r.StatusCode == 200 and data and data.success == true
+    if not ok then
+        warn("[WITHDRAWAL-HOLD] Failed | status=" .. tostring(r and r.StatusCode or "?") ..
+            " | body=" .. tostring(r and r.Body or ""))
+    end
+    return ok == true
+end
+
+local function settleUnconfirmedWithdrawalInner(tradeMethod, reason)
+    local wd = lastWithdrawalData and (lastWithdrawalData.data or lastWithdrawalData)
+    if not wd or not wd.id then
+        return "none"
+    end
+    if tradeProcessed then
+        return "busy"
+    end
+
+    -- Copies - the trade state can be reset under us while this waits.
+    local unitsBefore = withdrawalSettle.unitsBefore or {}
+    local gemsBefore = withdrawalSettle.gemsBefore
+    local gemsSent = tonumber(lastBotGemsAdded) or 0
+    local givenPets = {}
+    for _, g in ipairs(lastItemsGiven or {}) do
+        if g and g.uuid and g.type ~= "gems" then
+            table.insert(givenPets, g)
+        end
+    end
+
+    -- The trade has to be over before its result means anything.
+    if isInTrade() then
+        declineTrade()
+    end
+    local closedReads = 0
+    for _ = 1, 20 do
+        if isInTrade() then closedReads = 0 else closedReads = closedReads + 1 end
+        if closedReads >= 2 then break end
+        task.wait(0.5)
+    end
+    if closedReads < 2 then
+        holdWithdrawalForReview(wd, reason .. " - trade window would not close; check the bot's trade history")
+        return "held"
+    end
+
+    -- Nothing was ever put in the trade: nothing can have left.
+    if #givenPets == 0 and gemsSent <= 0 then
+        return cancelWithdrawalTrade(wd, reason, true) and "refunded" or "held"
+    end
+
+    local function readState()
+        local petsState = "none"
+        if #givenPets > 0 then
+            local inv = readInventoryPetTable()
+            if not inv then
+                petsState = "unknown"
+            else
+                local sent, kept, unknown = 0, 0, 0
+                for _, g in ipairs(givenPets) do
+                    local before = unitsBefore[tostring(g.uuid)]
+                    local rec = inv[g.uuid] or inv[tostring(g.uuid)]
+                    local now = rec and petUnitCount(rec) or 0
+                    if before == nil then
+                        unknown = unknown + 1
+                    elseif now < before then
+                        sent = sent + 1
+                    else
+                        kept = kept + 1
+                    end
+                end
+                if unknown > 0 then
+                    petsState = "unknown"
+                elseif kept == 0 then
+                    petsState = "sent"
+                elseif sent == 0 then
+                    petsState = "kept"
+                else
+                    petsState = "mixed"
+                end
+            end
+        end
+
+        local gemsState = "none"
+        if gemsSent > 0 then
+            local ok, now = pcall(getBotGemBalance)
+            -- getBotGemBalance returns 0 when it can't read the leaderstat,
+            -- so a 0 only counts when the bot really sent (nearly) all it had.
+            if not ok or type(now) ~= "number" or gemsBefore == nil
+                or (now == 0 and gemsBefore > gemsSent * 1.1)
+            then
+                gemsState = "unknown"
+            else
+                local dropped = gemsBefore - now
+                if dropped >= gemsSent * 0.9 then
+                    gemsState = "sent"
+                elseif dropped <= gemsSent * 0.1 then
+                    gemsState = "kept"
+                else
+                    gemsState = "unknown"
+                end
+            end
+        end
+
+        local allSent, allKept = true, true
+        for _, st in ipairs({ petsState, gemsState }) do
+            if st ~= "none" then
+                if st ~= "sent" then allSent = false end
+                if st ~= "kept" then allKept = false end
+            end
+        end
+        return (allSent and "sent") or (allKept and "kept") or "unclear", petsState, gemsState
+    end
+
+    -- "Sent" is final the moment it shows. "Kept" has to hold for 8 reads
+    -- a second apart - PS99's save can still show traded pets for a moment
+    -- after a trade completes, and refunding on that would be the dupe.
+    local verdict = "unclear"
+    local keptReads = 0
+    for attempt = 1, 14 do
+        local v, petsState, gemsState = readState()
+        print("[WITHDRAWAL-SETTLE] read " .. attempt .. " | pets=" .. petsState .. " gems=" .. gemsState .. " -> " .. v)
+        if v == "sent" then
+            verdict = "sent"
+            break
+        elseif v == "kept" then
+            keptReads = keptReads + 1
+            if keptReads >= 8 then
+                verdict = "kept"
+                break
+            end
+        else
+            keptReads = 0
+        end
+        task.wait(1)
+    end
+
+    if tradeProcessed then
+        return "busy"
+    end
+    if verdict == "sent" then
+        warn("[WITHDRAWAL-SETTLE] No success popup, but the pets/gems left the bot - confirming as delivered")
+        sendDiscord("\xE2\x9A\xA0\xEF\xB8\x8F **WITHDRAWAL RECOVERED (no popup, inventory-confirmed)**\n**Player:** " ..
+            tostring(lastTradeUsername) .. "\n**Reason:** " .. tostring(reason) ..
+            "\nThe items left the bot, so it was confirmed as delivered instead of refunded.", 16776960)
+        local ok, err = xpcall(handleTradeCompletion, function(e)
+            return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+        end, tradeMethod)
+        if not ok then
+            warn("[FATAL] handleTradeCompletion (withdrawal settle) crashed: " .. tostring(err))
+            holdWithdrawalForReview(wd, reason .. " - items left the bot but confirming crashed")
+            return "held"
+        end
+        return "delivered"
+    end
+
+    if verdict == "kept" then
+        return cancelWithdrawalTrade(wd, reason, true) and "refunded" or "held"
+    end
+
+    holdWithdrawalForReview(wd, reason ..
+        " - bot could not tell if the trade went through. Check its trade history: Approve if the player got it, Reject to refund")
+    sendDiscord("\xF0\x9F\x9A\xA8 **WITHDRAWAL HELD FOR REVIEW**\n**Player:** " .. tostring(lastTradeUsername) ..
+        "\n**Reason:** " .. tostring(reason) ..
+        "\nThe bot couldn't tell whether the items left. Check its trade history, then Approve or Reject it in admin.", 16711680)
+    return "held"
+end
+
+-- Returns "delivered" (confirmed, cleanup already done), "refunded",
+-- "held", "none" (no withdrawal to settle) or "busy" (another path is
+-- already settling this trade - the caller just stops).
+function settleUnconfirmedWithdrawal(tradeMethod, reason)
+    if withdrawalSettle.busy then
+        return "busy"
+    end
+    withdrawalSettle.busy = true
+    local wd = lastWithdrawalData and (lastWithdrawalData.data or lastWithdrawalData)
+    local ok, outcome = pcall(settleUnconfirmedWithdrawalInner, tradeMethod, tostring(reason or "Trade ended unconfirmed"))
+    withdrawalSettle.busy = false
+    if not ok then
+        warn("[WITHDRAWAL-SETTLE] crashed: " .. tostring(outcome))
+        holdWithdrawalForReview(wd, tostring(reason) .. " - settle step crashed")
+        return "held"
+    end
+    return outcome
+end
+end
+
+-- ============================================================
 -- MESSAGE LISTENER
 -- ============================================================
 local function connectMessage(localId, tradeMethod)
-    if not tradingMessage then
-        tradingMessage = playerGUI:FindFirstChild("Message")
-    end
+    -- Re-resolved every trade (ported from thebot.lua's 2026-10-10 fix:
+    -- "works the first time, then breaks after multiple trades... it
+    -- unbreaks when I rejoin"). PS99 can rebuild its Message popup between
+    -- trades; a reference kept from startup then points at a dead copy and
+    -- never sees another success message.
+    local freshGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+    if freshGui then playerGUI = freshGui end
+    tradingMessage = playerGUI:FindFirstChild("Message") or tradingMessage
     if not tradingMessage then
         warn("[MSG] tradingMessage not found - bot cannot detect trade completion!")
         sendDiscord("⚠️ **WARNING**: tradingMessage GUI not found - bot cannot detect trade completion for " .. tostring(lastTradeUsername), 16711680)
@@ -4608,7 +4880,19 @@ local function connectMessage(localId, tradeMethod)
         if low:find("success") or low:find("complet") then
             msgConn:Disconnect()
             print("[MSG] SUCCESS message confirmed - processing trade")
-            handleTradeCompletion(tradeMethod)
+            local ok, err = xpcall(handleTradeCompletion, function(e)
+                return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+            end, tradeMethod)
+            if not ok then
+                warn("[FATAL] handleTradeCompletion crashed: " .. tostring(err))
+                sendMessage("Something went wrong processing this trade - please contact support with a screenshot of this chat.")
+                goNext = true
+                tradeId = 0
+                lastGameTradeId = nil
+                method = nil
+                releaseIncomingTradeLock()
+                resetTradeState()
+            end
             pcall(function() tradingMessage.Enabled = false end)
 
         elseif low:find("cancel") or low:find("left") or low:find("decline") then
@@ -4637,18 +4921,101 @@ local function connectMessage(localId, tradeMethod)
 
     task.spawn(function()
         local startTime = tick()
+        local notInTradeCount = 0
         while (tick() - startTime) < TRADE_TIMEOUT_SECONDS and not goNext and tradeId == localId do
+            if isInTrade() then
+                notInTradeCount = 0
+            else
+                notInTradeCount = notInTradeCount + 1
+                if notInTradeCount >= 2 then
+                    print("[MSG] Trade window confirmed closed - not waiting out the full timeout")
+                    break
+                end
+            end
             task.wait(0.5)
         end
+        -- A moment for a late success popup before deciding it never came.
         if not tradeProcessed and not tradeCancelled and not goNext then
+            task.wait(1.5)
+        end
+        if not tradeProcessed and not tradeCancelled and not goNext then
+            -- Deposit with no popup: credit it only if the bot's own gems
+            -- AND pet count moved by what was verified at confirm (ported
+            -- from thebot.lua, 2026-10-11; re-read for 10s because a
+            -- lagging save shows new pets late - operator 2026-10-31:
+            -- "when the bot lags it just stops crediting"). Gems-only
+            -- deposits under 1M can't be told apart from passive income,
+            -- so those still go to the manual alert below.
+            if tradeMethod == "deposit" and withdrawalSettle.depositGemsBefore ~= nil
+                and (lastTradeGems > 0 or #lastTradeItems > 0)
+                and (#lastTradeItems > 0 or lastTradeGems >= 1000000)
+            then
+                local gemsBefore = withdrawalSettle.depositGemsBefore
+                local countBefore = withdrawalSettle.depositCountBefore
+                local landed = false
+                for _ = 1, 10 do
+                    if tradeProcessed or goNext then return end
+                    local okG, bal = pcall(getBotGemBalance)
+                    local okI, inv = pcall(getHugesTitanics)
+                    local count = (okI and type(inv) == "table") and #inv or nil
+                    local gemsOk = lastTradeGems <= 0
+                        or (okG and type(bal) == "number" and (bal - gemsBefore) >= lastTradeGems)
+                    local itemsOk = #lastTradeItems <= 0
+                        or (count ~= nil and countBefore ~= nil and (count - countBefore) >= #lastTradeItems)
+                    if gemsOk and itemsOk then
+                        landed = true
+                        break
+                    end
+                    task.wait(1)
+                end
+                if landed and not tradeProcessed and not goNext then
+                    warn("[MSG] No success popup, but the bot's gems/pets moved by the verified amounts - crediting")
+                    sendDiscord("\xE2\x9A\xA0\xEF\xB8\x8F **DEPOSIT RECOVERED (no popup, balance-confirmed)**\n**Player:** " ..
+                        tostring(lastTradeUsername), 16776960)
+                    pcall(function() msgConn:Disconnect() end)
+                    local ok, err = xpcall(handleTradeCompletion, function(e)
+                        return debug and debug.traceback and debug.traceback(tostring(e), 2) or tostring(e)
+                    end, tradeMethod)
+                    if not ok then
+                        warn("[FATAL] handleTradeCompletion (no-popup deposit) crashed: " .. tostring(err))
+                        goNext = true
+                        tradeId = 0
+                        lastGameTradeId = nil
+                        method = nil
+                        releaseIncomingTradeLock()
+                        resetTradeState()
+                    end
+                    return
+                end
+            end
+            if tradeProcessed or goNext then return end
+            -- Withdrawals settle by what actually left the bot - see
+            -- settleUnconfirmedWithdrawal.
+            if tradeMethod == "withdraw" and lastWithdrawalData and lastWithdrawalData.data then
+                pcall(function() msgConn:Disconnect() end)
+                local outcome = settleUnconfirmedWithdrawal(tradeMethod, "No success message received")
+                if outcome == "delivered" or outcome == "busy" then
+                    return
+                end
+                sendMessage(outcome == "refunded"
+                    and "Trade didn't go through - your items are back on the site. Please re-trade."
+                    or "Couldn't confirm this trade - your withdrawal is held for staff to check.")
+                sendDiscord("**WITHDRAWAL NO-MSG (" .. outcome .. ")**\n**Player:** " .. tostring(lastTradeUsername), 16776960)
+                goNext = true
+                tradeId = 0
+                lastGameTradeId = nil
+                method = nil
+                releaseIncomingTradeLock()
+                resetTradeState()
+                print("[TRADE] Withdrawal no-message settle complete (" .. outcome .. ") - ready for next trade")
+                return
+            end
+
             warn("[MSG] Trade ended without success message - NOT processing to avoid incorrect trade")
             sendDiscord("⚠️ **TRADE NO-MSG**\n**Player:** " .. tostring(lastTradeUsername) ..
                 "\n**Method:** " .. tostring(tradeMethod) ..
                 "\nTrade ended but no success message received - items NOT processed. Check manually.", 16776960)
             pcall(function() msgConn:Disconnect() end)
-            if tradeMethod == "withdraw" and lastWithdrawalData and lastWithdrawalData.data then
-                cancelWithdrawalTrade(lastWithdrawalData.data, "No success message received", true)
-            end
 
             goNext = true
             tradeId = 0
@@ -5552,6 +5919,21 @@ task.spawn(function()
         lastItemsGiven = itemsGiven
         lastBotGemsAdded = gemsGiven
 
+        -- Before-picture for settleUnconfirmedWithdrawal. Nothing leaves
+        -- the bot until the trade completes, so reading it now is exact.
+        withdrawalSettle.unitsBefore = {}
+        local invBefore = readInventoryPetTable()
+        for _, given in ipairs(itemsGiven) do
+            local rec = invBefore and given.uuid and (invBefore[given.uuid] or invBefore[tostring(given.uuid)])
+            if rec then
+                withdrawalSettle.unitsBefore[tostring(given.uuid)] = petUnitCount(rec)
+            end
+        end
+        if gemsGiven > 0 then
+            local gemsOkBefore, gemsBefore = pcall(getBotGemBalance)
+            withdrawalSettle.gemsBefore = (gemsOkBefore and type(gemsBefore) == "number" and gemsBefore > 0) and gemsBefore or nil
+        end
+
         if #itemsGiven > 0 then
             sendMessage(
                 "Added " ..
@@ -5678,19 +6060,20 @@ task.spawn(function()
                     "Trade timed out - cancelling"
                 )
 
-                cancelWithdrawalTrade(
-                    withdrawalData.data,
-                    "Timed out",
-                    true
-                )
+                -- Decline FIRST, then settle by what actually left the bot.
+                -- Refunding before the decline left a window where the
+                -- player could still confirm and get both.
+                declineTrade()
+                local outcome = settleUnconfirmedWithdrawal("withdraw", "Timed out")
+                if outcome == "delivered" or outcome == "busy" then
+                    return
+                end
 
                 sendDiscord(
-                    "Withdrawal timed out: " ..
+                    "Withdrawal timed out (" .. outcome .. "): " ..
                     username,
                     16776960
                 )
-
-                declineTrade()
 
                 goNext = true
                 tradeId = 0
