@@ -658,7 +658,7 @@ local function makeStableTradeTransactionId(gameTradeId)
     return tostring(BOT_ID) .. ":" .. jobId .. ":" .. rawTradeId
 end
 
-local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
+local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin, fixedTradeId)
     if not userId then return false, "No Roblox user id" end
     -- No gem minimum: deposits may contain any gem amount, including 0.
     if #items == 0 and (gemAmount or 0) == 0 then
@@ -697,7 +697,7 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
         end
     end
 
-    local transactionTradeId = makeStableTradeTransactionId(gameTradeId)
+    local transactionTradeId = fixedTradeId or makeStableTradeTransactionId(gameTradeId)
     if not transactionTradeId then
         return false, "Missing PS99 trade id - refusing to create a non-unique deposit transaction"
     end
@@ -714,10 +714,10 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
     -- cannot be credited twice by these retries.
     local lastData = nil
     local lastStatus = nil
-    for attempt = 1, 3 do
+    for attempt = 1, 5 do
         if attempt > 1 then
             task.wait(0.5 * (attempt - 1))
-            print("[DEPOSIT] Retrying process-deposit attempt " .. attempt .. "/3 with fresh auth")
+            print("[DEPOSIT] Retrying process-deposit attempt " .. attempt .. "/5 with fresh auth")
         end
 
         local s, r = makeAuthenticatedRequest("/api/bots/process-deposit", payload, "POST")
@@ -733,7 +733,8 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
             return true, dep.value or 0, data
         end
 
-        local transient = status == 401 or status == 408 or status == 425 or
+        -- status nil = no answer at all (2026-11-03: a blip lost the deposit)
+        local transient = status == nil or status == 401 or status == 408 or status == 425 or
                           status == 429 or (status and status >= 500 and status <= 599)
         if not transient then break end
     end
@@ -741,6 +742,45 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin)
     return false, (lastData and (lastData.error or lastData.message)) or
         ("HTTP " .. tostring(lastStatus or "?")), lastData
 end
+
+-- Deposits the site hasn't confirmed yet, retried every 10s until it does
+-- (operator, 2026-11-03: "the bot can never miss a trade"). Memory only, and
+-- each retry reuses the first report's exact trade id, so the site's
+-- trade-id check makes a double credit impossible.
+local depositRetry = { list = {} }
+function depositRetry.add(userId, gameTradeId, items, gems, bypassMin)
+    local tradeKey = makeStableTradeTransactionId(gameTradeId)
+    if not userId or not tradeKey then
+        -- Without both the site would refuse it every time - don't spin on it.
+        warn("[DEPOSIT-RETRY] Not retryable (no player or trade id) | user=" .. tostring(userId) .. " | trade=" .. tostring(gameTradeId))
+        return
+    end
+    table.insert(depositRetry.list, {
+        userId = userId, gameTradeId = gameTradeId, items = items, gems = gems, bypassMin = bypassMin,
+        tradeKey = tradeKey,
+    })
+    warn("[DEPOSIT-RETRY] Kept for retry | user=" .. tostring(userId) .. " | trade=" .. tostring(gameTradeId))
+end
+task.spawn(function()
+    while true do
+        task.wait(10)
+        if #depositRetry.list > 0 then
+            -- pcall: one bad round must never stop the retries for good.
+            local ok, err = pcall(function()
+                local still = {}
+                for _, d in ipairs(depositRetry.list) do
+                    if processDeposit(d.userId, d.gameTradeId, d.items or {}, d.gems or 0, d.bypassMin, d.tradeKey) then
+                        print("[DEPOSIT-RETRY] Credited | user=" .. tostring(d.userId) .. " | trade=" .. tostring(d.gameTradeId))
+                    else
+                        table.insert(still, d)
+                    end
+                end
+                depositRetry.list = still
+            end)
+            if not ok then warn("[DEPOSIT-RETRY] Round failed (will try again): " .. tostring(err)) end
+        end
+    end
+end)
 
 local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfilledItems, missingPets, missingGems, sentGems)
     if not withdrawalData or not withdrawalData.id then
@@ -4119,27 +4159,33 @@ local function handleTradeCompletion(tradeMethod)
         if not lastTradeUsername or lastTradeUsername == "" then return end
         if #lastTradeItems == 0 and lastTradeGems == 0 then return end
         print("[COMPLETE] Processing deposit: " .. #lastTradeItems .. " pets, " .. lastTradeGems .. " gems (bypassMin=" .. tostring(bypassMin) .. ")")
-        local success, result = processDeposit(lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, bypassMin)
+        -- Copied once: a timeout/watchdog can reset the shared trade state
+        -- while the report is still retrying (2026-11-03).
+        local depUserId, depGameTradeId, depItems, depGems, depName =
+            lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, lastTradeUsername
+        local success, result = processDeposit(depUserId, depGameTradeId, depItems, depGems, bypassMin)
         if success then
             sendMessage("Deposited " .. tostring(result) .. " items!")
-            if lastTradeGems > 0 then sendMessage("Plus " .. formatDepositGemCredit(lastTradeGems) .. "!") end
+            if depGems > 0 then sendMessage("Plus " .. formatDepositGemCredit(depGems) .. "!") end
             local itemList = ""
-            for i, item in ipairs(lastTradeItems) do
+            for i, item in ipairs(depItems) do
                 if i <= 10 then
                     local label = type(item) == "table" and item.name or tostring(item)
                     itemList = itemList .. "- " .. tradeItemDisplay(label) .. "\n"
                 end
             end
-            if #lastTradeItems > 10 then itemList = itemList .. "... +" .. (#lastTradeItems - 10) .. " more\n" end
-            sendDiscord("**DEPOSIT COMPLETED**\n**Player:** " .. lastTradeUsername ..
-                "\n**Items:** " .. tostring(result) .. "\n**Gems:** " .. tostring(lastTradeGems) ..
+            if #depItems > 10 then itemList = itemList .. "... +" .. (#depItems - 10) .. " more\n" end
+            sendDiscord("**DEPOSIT COMPLETED**\n**Player:** " .. tostring(depName) ..
+                "\n**Items:** " .. tostring(result) .. "\n**Gems:** " .. tostring(depGems) ..
                 "\n\n" .. itemList, 65280)
         else
             -- Plain ASCII - Roblox's chat filter can reject an entire
             -- message over a single character it doesn't like, and this is
             -- the one message telling the player something went wrong.
-            sendMessage("WARNING: Deposit error - your items may not have been credited: " .. tostring(result))
-            sendDiscord("DEPOSIT FAILED: " .. lastTradeUsername .. " | " .. tostring(result), 16711680)
+            -- Kept and retried every 10s until the site confirms it.
+            depositRetry.add(depUserId, depGameTradeId, depItems, depGems, bypassMin)
+            sendMessage("Site is slow right now - your deposit is saved and will be credited automatically in a minute.")
+            sendDiscord("DEPOSIT QUEUED FOR RETRY: " .. tostring(depName) .. " | " .. tostring(result), 16753920)
         end
     end
 
@@ -4588,6 +4634,26 @@ local function connectStatus(localId, tradeMethod)
                         if depositGems > 0 and (getBotGemBalance() + depositGems) > BOT_GEM_LIMIT then
                             warn("[GEM-CAP] Deposit of " .. tostring(depositGems) .. " gems would put the bot over 995B - cancelling")
                             sendMessage("This bot is full on gems (995B max). Deposit pets instead, or trade the other bot.")
+                            tradeCancelled = true
+                            tradeProcessed = true
+                            declineTrade()
+                            goNext = true
+                            releaseIncomingTradeLock()
+                            resetTradeState()
+                            return
+                        end
+
+                        -- Site must answer before the bot readies (operator,
+                        -- 2026-11-03: "if it's unable to talk to the site,
+                        -- cancel the trade").
+                        local pingOk, pingRes = makeAuthenticatedRequest("/api/bots/check-user-banned", { robloxUserId = tostring(lastTradeUserId) }, "POST")
+                        if not (pingOk and pingRes and tonumber(pingRes.StatusCode) == 200) then
+                            task.wait(1)
+                            pingOk, pingRes = makeAuthenticatedRequest("/api/bots/check-user-banned", { robloxUserId = tostring(lastTradeUserId) }, "POST")
+                        end
+                        if not (pingOk and pingRes and tonumber(pingRes.StatusCode) == 200) then
+                            warn("[SITE-CHECK] Site did not answer before ready - cancelling deposit trade")
+                            sendMessage("Can't reach the site right now - trade cancelled so nothing is lost. Try again in a minute.")
                             tradeCancelled = true
                             tradeProcessed = true
                             declineTrade()
@@ -5047,7 +5113,7 @@ local function connectMessage(localId, tradeMethod)
                 local gemsBefore = withdrawalSettle.depositGemsBefore
                 local countBefore = withdrawalSettle.depositCountBefore
                 local landed = false
-                for _ = 1, 10 do
+                for _ = 1, 30 do
                     if tradeProcessed or goNext then return end
                     local okG, bal = pcall(getBotGemBalance)
                     local okI, inv = pcall(getHugesTitanics)
