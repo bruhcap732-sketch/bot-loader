@@ -658,7 +658,7 @@ local function makeStableTradeTransactionId(gameTradeId)
     return tostring(BOT_ID) .. ":" .. jobId .. ":" .. rawTradeId
 end
 
-local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin, fixedTradeId)
+local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin, fixedTradeId, pending)
     if not userId then return false, "No Roblox user id" end
     -- No gem minimum: deposits may contain any gem amount, including 0.
     if #items == 0 and (gemAmount or 0) == 0 then
@@ -707,6 +707,9 @@ local function processDeposit(userId, gameTradeId, items, gemAmount, bypassMin, 
         robloxUserId = tostring(userId),
         items = payloadItems,
         gems = tonumber(gemAmount) or 0,
+        -- Before confirm: the site records the trade but doesn't credit it
+        -- until the finished report (same trade id) arrives.
+        pending = pending == true or nil,
     }
 
     -- Retry transient/auth failures with a fresh timestamp + nonce + signature.
@@ -748,6 +751,13 @@ end
 -- each retry reuses the first report's exact trade id, so the site's
 -- trade-id check makes a double credit impossible.
 local depositRetry = { list = {} }
+function depositRetry.cancelPending(gameTradeId)
+    local key = makeStableTradeTransactionId(gameTradeId)
+    if not key then return end
+    task.spawn(function()
+        pcall(function() makeAuthenticatedRequest("/api/bots/cancel-pending-deposit", { tradeId = key }, "POST") end)
+    end)
+end
 function depositRetry.add(userId, gameTradeId, items, gems, bypassMin)
     local tradeKey = makeStableTradeTransactionId(gameTradeId)
     if not userId or not tradeKey then
@@ -4522,6 +4532,24 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         end
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
 
+        if tradeMethod == "deposit" then
+            -- The site must have this trade on record BEFORE the bot confirms
+            -- (operator, 2026-11-04). If it doesn't, decline - nothing is taken.
+            local registered = processDeposit(lastTradeUserId, lastGameTradeId, confirmItems, confirmGems, false, nil, true)
+            if not registered then
+                warn("[SITE-REGISTER] Site did not record this deposit before confirm - declining")
+                sendMessage("Can't reach the site right now - trade cancelled so nothing is lost. Try again in a minute.")
+                tradeCancelled = true
+                tradeProcessed = true
+                declineTrade()
+                goNext = true
+                releaseIncomingTradeLock()
+                resetTradeState()
+                return
+            end
+            print("[SITE-REGISTER] Deposit registered with the site before confirm")
+        end
+
         pcall(function() tradingCommands.SetConfirmed(true) end)
         task.wait()
         local ok, state = pcall(function() return tradingCommands.GetState() end)
@@ -4764,12 +4792,22 @@ local function connectStatus(localId, tradeMethod)
             end
 
             if wasReady and not nowReady and confirmFired and tradeMethod == "deposit" and not tradeProcessed and not tradeCancelled then
+                -- A FINISHED trade also reads as "not ready" (the trade is
+                -- gone). Real loss 2026-11-04: a 20.2M deposit landed, the
+                -- popup was late, and this declined + wiped it. Window closed
+                -- = trade over: leave it to the popup / balance check.
+                if getTradeId() ~= localId or not isInTrade() then break end
                 task.wait(1)
-                if tradeProcessed or tradeCancelled then
-                    print("[STATUS] Trade already completed during grace period - skipping cancel")
+                if tradeProcessed or tradeCancelled or getTradeId() ~= localId or not isInTrade() then
+                    print("[STATUS] Trade finished or settled during grace period - skipping cancel")
                     return
                 end
+                if isPlayerReady() then
+                    -- A one-tick flicker; they're ready again. Keep watching.
+                    continue
+                end
                 warn("[STATUS] Deposit: user unreadied after confirm was fired - declining to prevent swap abuse")
+                depositRetry.cancelPending(lastGameTradeId)
                 sendMessage("Trade items changed - cancelling for safety!")
                 tradeCancelled = true
                 tradeProcessed = true
@@ -5065,6 +5103,7 @@ local function connectMessage(localId, tradeMethod)
                 sendMessage(saved and "Withdrawal saved - try again!" or "Contact support!")
                 sendDiscord((saved and "Withdrawal saved: " or "Withdrawal cancel failed: ") .. tostring(lastTradeUsername), 16776960)
             else
+                if tradeMethod == "deposit" then depositRetry.cancelPending(lastGameTradeId) end
                 sendDiscord("Trade cancelled: " .. tostring(lastTradeUsername), 16711680)
             end
             releaseIncomingTradeLock()
@@ -5565,6 +5604,10 @@ end)
 -- TRADE LOCK WATCHDOG
 -- ============================================================
 task.spawn(function()
+    -- Only a lock whose trade window has been closed ~60s with nothing
+    -- finishing it (2026-11-04: firing at 90s from pickup wiped trades that
+    -- were still being credited/settled).
+    local idleChecks = 0
     while true do
         task.wait(5)
 
@@ -5573,7 +5616,16 @@ task.spawn(function()
             and activeIncomingSince > 0
             and (tick() - activeIncomingSince) >= 90
             and not isInTrade()
+            and not tradeProcessed
+            and not withdrawalSettle.busy
         then
+            idleChecks = idleChecks + 1
+        else
+            idleChecks = 0
+        end
+
+        if idleChecks >= 12 then
+            idleChecks = 0
             warn("[TRADE-WATCHDOG] Stale incoming-trade lock detected - releasing safely")
             sendMessage("Trade didn't go through - please re-trade.")
             sendDiscord(
@@ -6294,6 +6346,7 @@ task.spawn(function()
                         and isInTrade()
                     then
                         sendMessage("Deposit timed out - cancelling")
+                        depositRetry.cancelPending(lastGameTradeId)
 
                         sendDiscord(
                             "Deposit timed out: " .. username,
