@@ -827,6 +827,10 @@ local function confirmWithdrawal(userId, withdrawalData, tradeDeliveryId, fulfil
         end
 
         local errorCode = data and tostring(data.error or "") or ""
+        if status == 409 and errorCode ~= "NOT_ASSIGNED" then
+            -- Already settled on the site; resending an old report could undo a newer one.
+            return false, "409: " .. errorCode
+        end
         if status == 409 and errorCode == "NOT_ASSIGNED" then
             print("[CONFIRM-WITHDRAWAL] NOT_ASSIGNED; refreshing pending withdrawal before retry")
             local refreshOk, refreshResp = makeAuthenticatedRequest(
@@ -890,13 +894,18 @@ local function cancelWithdrawalTrade(withdrawalData, reason, retry)
         reason = safeReason,
     }
 
-    local s, r = makeAuthenticatedRequest(
-        "/api/bots/cancel-withdrawal-trade",
-        payload,
-        "POST"
-    )
-
-    local data = decodeBody(r)
+    local s, r, data
+    for attempt = 1, 4 do
+        s, r = makeAuthenticatedRequest(
+            "/api/bots/cancel-withdrawal-trade",
+            payload,
+            "POST"
+        )
+        data = decodeBody(r)
+        if s and r and r.StatusCode == 200 and data and data.success == true then break end
+        if r and tonumber(r.StatusCode) == 409 then break end -- already settled
+        task.wait(attempt)
+    end
 
     if not (s and r and r.StatusCode == 200 and data and data.success == true) then
         warn(
@@ -4173,8 +4182,12 @@ local function handleTradeCompletion(tradeMethod)
         -- while the report is still retrying (2026-11-03).
         local depUserId, depGameTradeId, depItems, depGems, depName =
             lastTradeUserId, lastGameTradeId, lastTradeItems, lastTradeGems, lastTradeUsername
-        local success, result = processDeposit(depUserId, depGameTradeId, depItems, depGems, bypassMin)
-        if success then
+        local success, result, resData = processDeposit(depUserId, depGameTradeId, depItems, depGems, bypassMin)
+        local finalStatus = type(resData) == "table" and type(resData.deposit) == "table" and resData.deposit.status or nil
+        if success and finalStatus == "REJECTED" then
+            sendMessage("Your deposit needs a staff check - it is recorded on the site, contact support.")
+            sendDiscord("CRITICAL: completed deposit answered REJECTED by the site: " .. tostring(depName) .. " | trade=" .. tostring(depGameTradeId), 16711680)
+        elseif success then
             sendMessage("Deposited " .. tostring(result) .. " items!")
             if depGems > 0 then sendMessage("Plus " .. formatDepositGemCredit(depGems) .. "!") end
             local itemList = ""
@@ -4362,6 +4375,11 @@ local function handleTradeCompletion(tradeMethod)
                             confirmationSentGems
                         )
 
+                        if not retryOk and tostring(retryResult):sub(1, 4) == "409:" then
+                            print("[COMPLETE-RETRY] Site says this withdrawal is already settled - stopping retries")
+                            break
+                        end
+
                         if retryOk then
                             print("[COMPLETE-RETRY] Withdrawal successfully confirmed! | withdrawalId=" .. tostring(confirmationWithdrawal.id))
 
@@ -4528,17 +4546,22 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             -- getBotGemBalance returns 0 when it can't read, so 0 = unknown.
             withdrawalSettle.depositGemsBefore = (okG and type(bal) == "number" and bal > 0) and bal or nil
             local okI, inv = pcall(getHugesTitanics)
-            withdrawalSettle.depositCountBefore = (okI and type(inv) == "table") and #inv or nil
+            withdrawalSettle.depositCountBefore = (okI and type(inv) == "table" and #inv > 0) and #inv or nil
         end
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
 
         if tradeMethod == "deposit" then
             -- The site must have this trade on record BEFORE the bot confirms
             -- (operator, 2026-11-04). If it doesn't, decline - nothing is taken.
-            local registered = processDeposit(lastTradeUserId, lastGameTradeId, confirmItems, confirmGems, false, nil, true)
-            if not registered then
-                warn("[SITE-REGISTER] Site did not record this deposit before confirm - declining")
-                sendMessage("Can't reach the site right now - trade cancelled so nothing is lost. Try again in a minute.")
+            local registered, _, regData = processDeposit(lastTradeUserId, lastGameTradeId, confirmItems, confirmGems, false, nil, true)
+            local regStatus = type(regData) == "table" and type(regData.deposit) == "table" and regData.deposit.status or nil
+            if not registered or regStatus == "REJECTED" then
+                warn("[SITE-REGISTER] Site did not accept this deposit before confirm (status=" .. tostring(regStatus) .. ") - declining")
+                sendMessage(regStatus == "REJECTED"
+                    and "The site can't accept this deposit - trade cancelled, nothing taken."
+                    or "Can't reach the site right now - trade cancelled so nothing is lost. Try again in a minute.")
+                -- In case a slow registration still landed on the site.
+                depositRetry.cancelPending(lastGameTradeId)
                 tradeCancelled = true
                 tradeProcessed = true
                 declineTrade()
@@ -4548,8 +4571,17 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
                 return
             end
             print("[SITE-REGISTER] Deposit registered with the site before confirm")
+            if goNext or tradeCancelled or tradeId ~= localId or not isInTrade() then
+                -- Ended while registering; the bot never confirmed, so it can't have completed.
+                warn("[SITE-REGISTER] Trade ended while registering - not confirming")
+                depositRetry.cancelPending(localId)
+                return
+            end
         end
 
+        -- Set before confirming (not after), so the timeout and the popup
+        -- listener know a completion is possible from here on.
+        botConfirmed = true
         pcall(function() tradingCommands.SetConfirmed(true) end)
         task.wait()
         local ok, state = pcall(function() return tradingCommands.GetState() end)
@@ -5060,6 +5092,11 @@ local function connectMessage(localId, tradeMethod)
     local msgConn
     msgConn = tradingMessage:GetPropertyChangedSignal("Enabled"):Connect(function()
         if not tradingMessage.Enabled then return end
+        if lastGameTradeId ~= localId then
+            -- Left over from an earlier trade - not this one's popup.
+            pcall(function() msgConn:Disconnect() end)
+            return
+        end
 
         local text = ""
         pcall(function() text = tradingMessage.Frame.Contents.Desc.Text end)
@@ -5075,7 +5112,9 @@ local function connectMessage(localId, tradeMethod)
         print("[MSG] '" .. text .. "'")
         local low = text:lower()
 
-        if low:find("success") or low:find("complet") then
+        if (low:find("success") or low:find("complet"))
+            and not (low:find("not ") or low:find("fail") or low:find("incomplet") or low:find("cancel") or low:find("decline"))
+            and (tradeMethod ~= "deposit" or botConfirmed) then
             msgConn:Disconnect()
             print("[MSG] SUCCESS message confirmed - processing trade")
             local ok, err = xpcall(handleTradeCompletion, function(e)
@@ -5193,7 +5232,7 @@ local function connectMessage(localId, tradeMethod)
             if tradeMethod == "withdraw" and lastWithdrawalData and lastWithdrawalData.data then
                 pcall(function() msgConn:Disconnect() end)
                 local outcome = settleUnconfirmedWithdrawal(tradeMethod, "No success message received")
-                if outcome == "delivered" or outcome == "busy" then
+                if outcome == "delivered" or outcome == "busy" or lastGameTradeId ~= localId then
                     return
                 end
                 sendMessage(outcome == "refunded"
@@ -6277,7 +6316,7 @@ task.spawn(function()
                 -- player could still confirm and get both.
                 declineTrade()
                 local outcome = settleUnconfirmedWithdrawal("withdraw", "Timed out")
-                if outcome == "delivered" or outcome == "busy" then
+                if outcome == "delivered" or outcome == "busy" or lastGameTradeId ~= localId then
                     return
                 end
 
@@ -6344,7 +6383,15 @@ task.spawn(function()
                     if not goNext
                         and tradeId == localId
                         and isInTrade()
+                        and not tradeProcessed
                     then
+                        if botConfirmed then
+                            -- Could be completing this very second: just close it and let
+                            -- the popup / balance check settle it (credit, or it stays
+                            -- registered for admin) - never cancel it here.
+                            declineTrade()
+                            return
+                        end
                         sendMessage("Deposit timed out - cancelling")
                         depositRetry.cancelPending(lastGameTradeId)
 
