@@ -223,7 +223,7 @@ local lastBotGemsAdded   = 0  -- gems bot actually sent (derived from botGemBala
 -- withdrawal trade (UUID -> units) and its gem balance, read right after
 -- adding them, plus a busy flag - see settleUnconfirmedWithdrawal. One
 -- table: the main chunk is close to Luau's 200-local limit.
-local withdrawalSettle = { unitsBefore = {}, gemsBefore = nil, busy = false, depositGemsBefore = nil, depositCountBefore = nil }
+local withdrawalSettle = { unitsBefore = {}, gemsBefore = nil, busy = false, depositGemsBefore = nil, depositCountBefore = nil, lookupIds = {} }
 local botGemBalance      = 0  -- latest backend-held gem balance
 local botGemBalancePresent = false -- true once heartbeat supplies a valid heldGemsBalance
 local lastGemsRequested  = 0  -- what we asked the game to add (reliable even after window closes)
@@ -487,8 +487,16 @@ local function getPendingWithdrawal(userId)
     local LOOKUP_ATTEMPTS = 3
     local LOOKUP_DELAY = 0.10
 
+    -- One id for every attempt of this lookup (2026-11-14, live: a claim
+    -- whose answer got lost left the withdrawal stuck PROCESSING while the
+    -- retry heard "nothing pending" and the trade opened as a deposit). The
+    -- site hands a retry with the same id the same claim. Kept for 2 minutes
+    -- after a failed lookup so the player's next trade picks it up too.
+    local remembered = withdrawalSettle.lookupIds[tostring(userId)]
+    local lookupId = (remembered and os.time() - remembered.at < 120) and remembered.id or randomNonce()
+
     for attempt = 1, LOOKUP_ATTEMPTS do
-        local payload = { userId = tostring(userId) }
+        local payload = { userId = tostring(userId), lookupId = lookupId }
 
         print("[WITHDRAWAL] Lookup attempt " .. tostring(attempt) .. "/" .. tostring(LOOKUP_ATTEMPTS) .. " | userId=" .. tostring(userId))
 
@@ -502,6 +510,7 @@ local function getPendingWithdrawal(userId)
             local data = decodeBody(r)
 
             if data and data.success then
+                withdrawalSettle.lookupIds[tostring(userId)] = nil
                 if data.withdrawal then
                     local wd = data.withdrawal
                     print("[WITHDRAWAL] Found withdrawal | attempt=" .. tostring(attempt) ..
@@ -599,6 +608,7 @@ local function getPendingWithdrawal(userId)
     end
 
     print("[WITHDRAWAL] Lookup failed after " .. tostring(LOOKUP_ATTEMPTS) .. " checks - MUST NOT enter DEPOSIT MODE")
+    withdrawalSettle.lookupIds[tostring(userId)] = { id = lookupId, at = os.time() }
     return {
         success = false,
         data = nil,
@@ -1386,8 +1396,93 @@ local function addPet(uuid)
     return false, lastErr or "Pet was not added to trade"
 end
 
+-- The bot's own side of the open trade, read from the trade state (same
+-- layout addPet and client_trade_gems read): its Diamonds, and whether a pet
+-- UUID is in it. nil when the state can't be read at all. Fields on
+-- withdrawalSettle, not new locals - the main chunk is near Luau's limit.
+function withdrawalSettle.find(value, test, depth, seen)
+    if type(value) ~= "table" or depth > 8 or seen[value] then return nil end
+    seen[value] = true
+    for key, child in pairs(value) do
+        local hit = test(key, child)
+        if hit ~= nil then return hit end
+        hit = withdrawalSettle.find(child, test, depth + 1, seen)
+        if hit ~= nil then return hit end
+    end
+    return nil
+end
+function withdrawalSettle.botSide()
+    local ok, state = pcall(function() return tradingCommands.GetState() end)
+    if not ok or type(state) ~= "table" or type(state._players) ~= "table" or type(state._items) ~= "table" then
+        return nil
+    end
+    for index, player in pairs(state._players) do
+        if player == localPlayer then
+            return type(state._items[index]) == "table" and state._items[index] or {}
+        end
+    end
+    return nil
+end
+function withdrawalSettle.botTradeGems()
+    local side = withdrawalSettle.botSide()
+    if not side then return nil end
+    return withdrawalSettle.find(side, function(_, child)
+        if type(child) == "table" and tostring(child.id) == "Diamonds" and tonumber(child._am) then
+            return tonumber(child._am)
+        end
+        return nil
+    end, 0, {}) or 0
+end
+-- How the bot's side of the trade differs from what it's about to report
+-- as handed over ("2 pets missing, 5000 gems missing"), or nil when it
+-- matches - or when the state can't be read (then nothing changes).
+function withdrawalSettle.botSideShort()
+    local side = withdrawalSettle.botSide()
+    if not side then return nil end
+    local missingPets = 0
+    for _, given in ipairs(lastItemsGiven or {}) do
+        if given and given.uuid and given.type ~= "gems" then
+            local wanted = tostring(given.uuid)
+            local found = withdrawalSettle.find(side, function(key, child)
+                if tostring(key) == wanted or (type(child) == "string" and child == wanted) then return true end
+                return nil
+            end, 0, {})
+            if not found then missingPets = missingPets + 1 end
+        end
+    end
+    local gemsWanted = tonumber(lastBotGemsAdded) or 0
+    local gemsIn = withdrawalSettle.botTradeGems() or 0
+    local parts = {}
+    if missingPets > 0 then table.insert(parts, missingPets .. " pets missing") end
+    if gemsIn < gemsWanted then table.insert(parts, (gemsWanted - gemsIn) .. " gems missing") end
+    if gemsIn > gemsWanted then table.insert(parts, (gemsIn - gemsWanted) .. " extra gems") end
+    return #parts > 0 and table.concat(parts, ", ") or nil
+end
+
+-- 2026-11-14 (live: a 6.5B gem withdrawal marked complete with nothing
+-- received; a 5B one sat with the bot side empty): SetCurrency was never
+-- checked, so a call the game dropped still counted as paid. It now has to
+-- show up in the trade, or it doesn't count. Unreadable state keeps the
+-- old behaviour rather than blocking every gem withdrawal.
 local function addGems(amount)
-    pcall(function() tradingCommands.SetCurrency("Diamonds", amount) end)
+    local readable = false
+    for attempt = 1, 3 do
+        pcall(function() tradingCommands.SetCurrency("Diamonds", amount) end)
+        for _ = 1, 12 do
+            local inTrade = withdrawalSettle.botTradeGems()
+            if inTrade ~= nil then
+                readable = true
+                if inTrade >= amount then return true end
+            end
+            task.wait(0.05)
+        end
+        warn("[WITHDRAWAL] SetCurrency attempt " .. attempt .. "/3: " .. tostring(amount) .. " gems not in the trade yet")
+    end
+    if not readable then
+        warn("[WITHDRAWAL] Trade state unreadable - can't verify gems, continuing as before")
+        return true
+    end
+    return false
 end
 
 -- ============================================================
@@ -4071,9 +4166,7 @@ local function addWithdrawalItems(withdrawalData)
     if gemsRequested > 0 then
         local botBalance = getBotGemBalance()
 
-        if botBalance >= gemsRequested then
-            addGems(gemsRequested)
-
+        if botBalance >= gemsRequested and addGems(gemsRequested) then
             lastBotGemsAdded = gemsRequested
 
             print(
@@ -4081,9 +4174,7 @@ local function addWithdrawalItems(withdrawalData)
                 tostring(gemsRequested)
             )
 
-        elseif botBalance > 0 then
-            addGems(botBalance)
-
+        elseif botBalance > 0 and botBalance < gemsRequested and addGems(botBalance) then
             lastBotGemsAdded = botBalance
 
             lastWithdrawalMissing.gems =
@@ -4095,6 +4186,12 @@ local function addWithdrawalItems(withdrawalData)
                 ", missing " ..
                 tostring(lastWithdrawalMissing.gems)
             )
+
+        elseif botBalance > 0 then
+            -- The game never put them in the trade - nothing paid, stays owed.
+            pcall(function() tradingCommands.SetCurrency("Diamonds", 0) end)
+            lastWithdrawalMissing.gems = gemsRequested
+            warn("[WITHDRAWAL] Gems did not land in the trade - kept owed: " .. tostring(gemsRequested))
 
         else
             lastWithdrawalMissing.gems =
@@ -4575,6 +4672,27 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
                 -- Ended while registering; the bot never confirmed, so it can't have completed.
                 warn("[SITE-REGISTER] Trade ended while registering - not confirming")
                 depositRetry.cancelPending(localId)
+                return
+            end
+        end
+
+        if isWithdraw then
+            -- What the bot reports as handed over has to really be in its
+            -- side of the trade (2026-11-14: a withdrawal completed with
+            -- nothing in it). Not matching -> back out and refund, never
+            -- confirm. Declined first: unconfirmed, it can't complete.
+            local short = withdrawalSettle.botSideShort()
+            if short then
+                warn("[CONFIRM-CHECK] Bot side doesn't match the withdrawal (" .. short .. ") - cancelling")
+                sendMessage("Bot's side didn't load right - trade cancelled, your withdrawal is back on the site. Trade again!")
+                tradeCancelled = true
+                tradeProcessed = true
+                declineTrade()
+                local wdData = lastWithdrawalData and (lastWithdrawalData.data or lastWithdrawalData)
+                if wdData then cancelWithdrawalTrade(wdData, "Bot side didn't match at confirm: " .. short, true) end
+                goNext = true
+                releaseIncomingTradeLock()
+                resetTradeState()
                 return
             end
         end
@@ -5112,9 +5230,12 @@ local function connectMessage(localId, tradeMethod)
         print("[MSG] '" .. text .. "'")
         local low = text:lower()
 
+        -- botConfirmed for withdrawals too (2026-11-14): no trade completes
+        -- without the bot's confirm, so any other "success" message must
+        -- never mark a withdrawal paid.
         if (low:find("success") or low:find("complet"))
             and not (low:find("not ") or low:find("fail") or low:find("incomplet") or low:find("cancel") or low:find("decline"))
-            and (tradeMethod ~= "deposit" or botConfirmed) then
+            and botConfirmed then
             msgConn:Disconnect()
             print("[MSG] SUCCESS message confirmed - processing trade")
             local ok, err = xpcall(handleTradeCompletion, function(e)
