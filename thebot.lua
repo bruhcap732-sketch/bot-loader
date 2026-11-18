@@ -5187,11 +5187,12 @@ local function settleUnconfirmedWithdrawalInner(tradeMethod, reason)
     -- "Sent" is final the moment it shows. "Kept" has to hold for 8 reads
     -- a second apart - PS99's save can still show traded pets for a moment
     -- after a trade completes, and refunding on that would be the dupe.
-    -- 15 reads over up to 25 s (2026-11-18, was 8 of 14): a save lagging
-    -- past 8 s read as "kept" and refunded a delivered trade.
+    -- 30 reads over up to 40 s (2026-11-18, was 8 of 14): a save lagging
+    -- past the old window read as "kept" and refunded a delivered trade. A
+    -- second that can't be read neither counts nor starts the count over.
     local verdict = "unclear"
     local keptReads = 0
-    for attempt = 1, 25 do
+    for attempt = 1, 40 do
         local v, petsState, gemsState = readState()
         print("[WITHDRAWAL-SETTLE] read " .. attempt .. " | pets=" .. petsState .. " gems=" .. gemsState .. " -> " .. v)
         if v == "sent" then
@@ -5199,10 +5200,12 @@ local function settleUnconfirmedWithdrawalInner(tradeMethod, reason)
             break
         elseif v == "kept" then
             keptReads = keptReads + 1
-            if keptReads >= 15 then
+            if keptReads >= 30 then
                 verdict = "kept"
                 break
             end
+        elseif petsState == "unknown" or gemsState == "unknown" then
+            -- unreadable this second: skip it
         else
             keptReads = 0
         end
@@ -6420,6 +6423,29 @@ task.spawn(function()
         if gemsGiven > 0 then
             local gemsOkBefore, gemsBefore = pcall(getBotGemBalance)
             withdrawalSettle.gemsBefore = (gemsOkBefore and type(gemsBefore) == "number" and gemsBefore > 0) and gemsBefore or nil
+        end
+
+        -- Without a full before-picture the bot can't later tell a decline
+        -- from a delivery, and a decline would be marked delivered (2026-11-18
+        -- review). Not readied yet, so backing out here can't lose anything.
+        local snapshotOk = gemsGiven <= 0 or withdrawalSettle.gemsBefore ~= nil
+        for _, given in ipairs(itemsGiven) do
+            if given.uuid and given.type ~= "gems" and withdrawalSettle.unitsBefore[tostring(given.uuid)] == nil then
+                snapshotOk = false
+            end
+        end
+        if not snapshotOk then
+            warn("[WITHDRAWAL] Could not read the bot's inventory before ready - backing out")
+            sendMessage("Couldn't read the bot's inventory - trade cancelled, your withdrawal is safe. Trade again!")
+            declineTrade()
+            cancelWithdrawalTrade(withdrawalData.data, "Could not read the bot's inventory before ready", true)
+            goNext = true
+            tradeId = 0
+            lastGameTradeId = nil
+            method = nil
+            releaseIncomingTradeLock()
+            resetTradeState()
+            continue
         end
 
         if #itemsGiven > 0 then
