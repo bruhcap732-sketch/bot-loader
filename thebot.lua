@@ -1148,11 +1148,16 @@ end
 local function acceptTradeRequest(player)
     print("[ACCEPT] Accepting trade from " .. tostring(player.Name))
 
+    -- Only a trade WITH this player counts (2026-11-14 review: any open
+    -- trade used to count, so a left-over window took the next player's
+    -- withdrawal - "the bot gave someone else's item").
     local function checkAccepted()
         for _ = 1, 4 do
-            if isInTrade() then
-                local id = getTradeId()
-                if id and id ~= 0 then return id end
+            local ok, state = pcall(function() return tradingCommands.GetState() end)
+            if ok and type(state) == "table" and (state._id or 0) ~= 0 and type(state._players) == "table" then
+                for _, p in pairs(state._players) do
+                    if p == player then return state._id end
+                end
             end
             task.wait(0.025)
         end
@@ -1179,11 +1184,10 @@ local function acceptTradeRequest(player)
     end
 
     for attempt = 1, 6 do
-        if type(tradingCommands.Request) == "function" then
-            id = tryCommand(function() tradingCommands.Request(player) end, "Request")
-            if id then return id end
-        end
-
+        -- No tradingCommands.Request(player) here any more (2026-11-18): when
+        -- the player had already cancelled, it SENT them a trade request that
+        -- stayed open, and accepting it later opened a trade with the bot in
+        -- the middle of someone else's withdrawal. The bot never sends requests.
         if type(tradingCommands.Accept) == "function" then
             id = tryCommand(function() tradingCommands.Accept(player) end, "Accept")
             if id then return id end
@@ -1394,6 +1398,25 @@ local function addPet(uuid)
     end
 
     return false, lastErr or "Pet was not added to trade"
+end
+
+-- True only while the open trade is the one this flow accepted (same game
+-- trade id) AND the other side is the player it was accepted for (2026-11-18,
+-- owner report of a live exploit: a trade request the bot had sent earlier was
+-- accepted the moment the real withdrawer's trade closed, and the bot kept
+-- adding, readying and confirming their items in the new trade).
+function withdrawalSettle.tradeIsOurs(localId, expectedUserId)
+    local ok, state = pcall(function() return tradingCommands.GetState() end)
+    if not ok or type(state) ~= "table" or (state._id or 0) == 0 or type(state._players) ~= "table" then return false end
+    if localId == nil or state._id ~= localId then return false end
+    local partner = false
+    for _, p in pairs(state._players) do
+        if p ~= localPlayer then
+            if typeof(p) ~= "Instance" or not p:IsA("Player") or tostring(p.UserId) ~= tostring(expectedUserId) then return false end
+            partner = true
+        end
+    end
+    return partner
 end
 
 -- The bot's own side of the open trade, read from the trade state (same
@@ -3533,6 +3556,22 @@ local function getHugesTitanics(requestedItems)
     return results
 end
 
+-- How many of exactly this deposit's pets (identity "id|variant") the bot
+-- holds. The no-popup credit used to count every Huge it owned, so an
+-- earlier trade's pet showing up late could "prove" a cancelled deposit
+-- (2026-11-14 review). A field, not a local - the main chunk is near the limit.
+function withdrawalSettle.countValidated(inv, items)
+    local want = {}
+    for _, it in ipairs(items or {}) do
+        want[tostring(type(it) == "table" and it.name or it):lower()] = true
+    end
+    local n = 0
+    for _, p in ipairs(inv or {}) do
+        if want[(tostring(p.id) .. "|" .. tostring(p.variant)):lower()] then n = n + 1 end
+    end
+    return n
+end
+
 local function getBotGemBalance()
     local balance = 0
 
@@ -4643,7 +4682,7 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             -- getBotGemBalance returns 0 when it can't read, so 0 = unknown.
             withdrawalSettle.depositGemsBefore = (okG and type(bal) == "number" and bal > 0) and bal or nil
             local okI, inv = pcall(getHugesTitanics)
-            withdrawalSettle.depositCountBefore = (okI and type(inv) == "table" and #inv > 0) and #inv or nil
+            withdrawalSettle.depositCountBefore = (okI and type(inv) == "table" and #inv > 0) and withdrawalSettle.countValidated(inv, confirmItems) or nil
         end
         print("[CONFIRM-CHECK] ✅ User side verified (" .. tradeMethod .. "): " .. #confirmItems .. " pets + " .. confirmGems .. " gems")
 
@@ -4697,6 +4736,28 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
             end
         end
 
+        -- Never confirm a trade that isn't the one accepted, with the player
+        -- it was accepted for (see withdrawalSettle.tradeIsOurs).
+        if not withdrawalSettle.tradeIsOurs(localId, lastTradeUserId) then
+            warn("[TRADE-GUARD] Open trade is not the accepted one / wrong player - cancelling, not confirming")
+            sendDiscord("🚨 **TRADE SWAP BLOCKED**\n**Expected player:** " .. tostring(lastTradeUsername) ..
+                " (" .. tostring(lastTradeUserId) .. ")\n**Method:** " .. tradeMethod ..
+                "\nThe open trade changed to a different trade/player before confirm. Declined, nothing confirmed.", 16711680)
+            tradeCancelled = true
+            tradeProcessed = true
+            declineTrade()
+            if isWithdraw and lastWithdrawalData then
+                local wdData = lastWithdrawalData.data or lastWithdrawalData
+                cancelWithdrawalTrade(wdData, "Trade swapped to another trade/player before confirm", true)
+            elseif tradeMethod == "deposit" then
+                depositRetry.cancelPending(localId)
+            end
+            goNext = true
+            releaseIncomingTradeLock()
+            resetTradeState()
+            return
+        end
+
         -- Set before confirming (not after), so the timeout and the popup
         -- listener know a completion is possible from here on.
         botConfirmed = true
@@ -4737,6 +4798,10 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         for _ = 1, 30 do
             task.wait(2)
             if goNext or tradeProcessed or tradeCancelled or tradeId ~= localId or not isInTrade() then break end
+            if not withdrawalSettle.tradeIsOurs(localId, lastTradeUserId) then
+                warn("[TRADE-GUARD] Open trade is no longer the confirmed one - not re-confirming")
+                break
+            end
             if client_trade_gems() ~= verifiedGems then break end
             local _, nowItems = checkItems(isWithdraw)
             if type(nowItems) ~= "table" or #nowItems ~= verifiedCount then break end
@@ -5255,20 +5320,31 @@ local function connectMessage(localId, tradeMethod)
 
         elseif low:find("cancel") or low:find("left") or low:find("decline") then
             msgConn:Disconnect()
+            -- A running settle (withdrawal timeout) decides this trade by what
+            -- left the bot; marking it processed here would leave nobody to
+            -- release the lock.
+            if withdrawalSettle.busy then
+                pcall(function() tradingMessage.Enabled = false end)
+                return
+            end
             tradeCancelled = true
             tradeProcessed = true
+            -- Read before yielding (2026-11-14 review): after sendMessage the
+            -- globals can already belong to the next player's trade.
+            local cancelWd = lastWithdrawalData and lastWithdrawalData.data
             sendMessage("Trade cancelled")
-            if tradeMethod == "withdraw" and lastWithdrawalData and lastWithdrawalData.data then
-                local saved = cancelWithdrawalTrade(lastWithdrawalData.data, "Cancelled by player", true)
+            if tradeMethod == "withdraw" and cancelWd then
+                local saved = cancelWithdrawalTrade(cancelWd, "Cancelled by player", true)
                 sendMessage(saved and "Withdrawal saved - try again!" or "Contact support!")
                 sendDiscord((saved and "Withdrawal saved: " or "Withdrawal cancel failed: ") .. tostring(lastTradeUsername), 16776960)
             else
-                if tradeMethod == "deposit" then depositRetry.cancelPending(lastGameTradeId) end
+                if tradeMethod == "deposit" then depositRetry.cancelPending(localId) end
                 sendDiscord("Trade cancelled: " .. tostring(lastTradeUsername), 16711680)
             end
-            releaseIncomingTradeLock()
-            goNext = true
             pcall(function() tradingMessage.Enabled = false end)
+            -- Another path already ended this trade; the bot may be on the next one.
+            if lastGameTradeId ~= localId then return end
+            releaseIncomingTradeLock()
             goNext = true
             resetTradeState()
 
@@ -5294,10 +5370,12 @@ local function connectMessage(localId, tradeMethod)
             task.wait(0.5)
         end
         -- A moment for a late success popup before deciding it never came.
-        if not tradeProcessed and not tradeCancelled and not goNext then
+        -- Only while this is still the bot's current trade (2026-11-14
+        -- review): once it's reset, these globals belong to the NEXT trade.
+        if not tradeProcessed and not tradeCancelled and not goNext and lastGameTradeId == localId then
             task.wait(1.5)
         end
-        if not tradeProcessed and not tradeCancelled and not goNext then
+        if not tradeProcessed and not tradeCancelled and not goNext and lastGameTradeId == localId then
             -- Deposit with no popup: credit it only if the bot's own gems
             -- AND pet count moved by what was verified at confirm (ported
             -- from thebot.lua, 2026-10-11; re-read for 10s because a
@@ -5305,7 +5383,9 @@ local function connectMessage(localId, tradeMethod)
             -- "when the bot lags it just stops crediting"). Gems-only
             -- deposits under 1M can't be told apart from passive income,
             -- so those still go to the manual alert below.
-            if tradeMethod == "deposit" and withdrawalSettle.depositGemsBefore ~= nil
+            -- botConfirmed (2026-11-14 review): a trade the bot never
+            -- confirmed can't have completed, whatever the balance does.
+            if tradeMethod == "deposit" and botConfirmed and withdrawalSettle.depositGemsBefore ~= nil
                 and (lastTradeGems > 0 or #lastTradeItems > 0)
                 and (#lastTradeItems > 0 or lastTradeGems >= 1000000)
             then
@@ -5313,10 +5393,10 @@ local function connectMessage(localId, tradeMethod)
                 local countBefore = withdrawalSettle.depositCountBefore
                 local landed = false
                 for _ = 1, 30 do
-                    if tradeProcessed or goNext then return end
+                    if tradeProcessed or goNext or lastGameTradeId ~= localId then return end
                     local okG, bal = pcall(getBotGemBalance)
                     local okI, inv = pcall(getHugesTitanics)
-                    local count = (okI and type(inv) == "table") and #inv or nil
+                    local count = (okI and type(inv) == "table") and withdrawalSettle.countValidated(inv, lastTradeItems) or nil
                     local gemsOk = lastTradeGems <= 0
                         or (okG and type(bal) == "number" and (bal - gemsBefore) >= lastTradeGems)
                     local itemsOk = #lastTradeItems <= 0
@@ -5327,7 +5407,7 @@ local function connectMessage(localId, tradeMethod)
                     end
                     task.wait(1)
                 end
-                if landed and not tradeProcessed and not goNext then
+                if landed and not tradeProcessed and not goNext and lastGameTradeId == localId then
                     warn("[MSG] No success popup, but the bot's gems/pets moved by the verified amounts - crediting")
                     sendDiscord("\xE2\x9A\xA0\xEF\xB8\x8F **DEPOSIT RECOVERED (no popup, balance-confirmed)**\n**Player:** " ..
                         tostring(lastTradeUsername), 16776960)
@@ -5347,7 +5427,7 @@ local function connectMessage(localId, tradeMethod)
                     return
                 end
             end
-            if tradeProcessed or goNext then return end
+            if tradeProcessed or goNext or lastGameTradeId ~= localId then return end
             -- Withdrawals settle by what actually left the bot - see
             -- settleUnconfirmedWithdrawal.
             if tradeMethod == "withdraw" and lastWithdrawalData and lastWithdrawalData.data then
@@ -5900,6 +5980,10 @@ task.spawn(function()
         activeIncomingSince = tick()
         goNext = false
 
+        -- No flow owns a trade that's still open now - close it so it can
+        -- never be handed to this player.
+        if isInTrade() then declineTrade() end
+
         print("[TRADE] Incoming from: " .. username .. " (" .. userId .. ") [LOCKED]")
 
         local userInfo = checkUserBanned(userId)
@@ -6194,6 +6278,19 @@ task.spawn(function()
             continue
         end
 
+        if not withdrawalSettle.tradeIsOurs(localId, userId) then
+            warn("[TRADE-GUARD] Withdrawal trade is not with " .. username .. " - not adding anything")
+            declineTrade()
+            cancelWithdrawalTrade(withdrawalData.data, "Open trade was not with the withdrawing player", true)
+            goNext = true
+            tradeId = 0
+            lastGameTradeId = nil
+            method = nil
+            releaseIncomingTradeLock()
+            resetTradeState()
+            continue
+        end
+
         sendMessage("== WITHDRAWAL MODE ==")
         sendMessage("Bot is sending you your items.")
         sendDiscord("Withdrawal started: " .. username, 16776960)
@@ -6352,6 +6449,21 @@ task.spawn(function()
 
         local readyOk = false
 
+        if not withdrawalSettle.tradeIsOurs(localId, userId) then
+            warn("[TRADE-GUARD] Withdrawal trade changed to another trade/player before ready - cancelling")
+            sendDiscord("🚨 **WITHDRAWAL SWAP BLOCKED**\n**Player:** " .. username ..
+                "\nThe open trade was no longer theirs before ready. Declined and requeued.", 16711680)
+            declineTrade()
+            cancelWithdrawalTrade(withdrawalData.data, "Trade swapped to another trade/player before ready", true)
+            goNext = true
+            tradeId = 0
+            lastGameTradeId = nil
+            method = nil
+            releaseIncomingTradeLock()
+            resetTradeState()
+            continue
+        end
+
         for attempt = 1, 3 do
             if goNext or tradeId ~= localId then
                 break
@@ -6469,6 +6581,8 @@ task.spawn(function()
         )
 
         warn("[ACCEPT] No actual trade opened - resetting state")
+        -- Whatever trade did open (not this player's) must not stay open.
+        if isInTrade() then declineTrade() end
         tradeId = 0
         lastGameTradeId = nil
         method = nil
