@@ -1184,10 +1184,11 @@ local function acceptTradeRequest(player)
     end
 
     for attempt = 1, 6 do
-        -- No tradingCommands.Request(player) here any more (2026-11-18): when
-        -- the player had already cancelled, it SENT them a trade request that
-        -- stayed open, and accepting it later opened a trade with the bot in
-        -- the middle of someone else's withdrawal. The bot never sends requests.
+        if type(tradingCommands.Request) == "function" then
+            id = tryCommand(function() tradingCommands.Request(player) end, "Request")
+            if id then return id end
+        end
+
         if type(tradingCommands.Accept) == "function" then
             id = tryCommand(function() tradingCommands.Accept(player) end, "Accept")
             if id then return id end
@@ -4737,7 +4738,10 @@ local function connectConfirm(localId, tradeMethod, validatedItems, validatedGem
         end
 
         -- Never confirm a trade that isn't the one accepted, with the player
-        -- it was accepted for (see withdrawalSettle.tradeIsOurs).
+        -- it was accepted for (see withdrawalSettle.tradeIsOurs). A trade that
+        -- already ended (or a flow that's already over) just stops here - the
+        -- cancel handler settles it, and the next player's trade is not ours.
+        if goNext or tradeCancelled or tradeId ~= localId or not isInTrade() then return end
         if not withdrawalSettle.tradeIsOurs(localId, lastTradeUserId) then
             warn("[TRADE-GUARD] Open trade is not the accepted one / wrong player - cancelling, not confirming")
             sendDiscord("🚨 **TRADE SWAP BLOCKED**\n**Expected player:** " .. tostring(lastTradeUsername) ..
@@ -5183,9 +5187,11 @@ local function settleUnconfirmedWithdrawalInner(tradeMethod, reason)
     -- "Sent" is final the moment it shows. "Kept" has to hold for 8 reads
     -- a second apart - PS99's save can still show traded pets for a moment
     -- after a trade completes, and refunding on that would be the dupe.
+    -- 15 reads over up to 25 s (2026-11-18, was 8 of 14): a save lagging
+    -- past 8 s read as "kept" and refunded a delivered trade.
     local verdict = "unclear"
     local keptReads = 0
-    for attempt = 1, 14 do
+    for attempt = 1, 25 do
         local v, petsState, gemsState = readState()
         print("[WITHDRAWAL-SETTLE] read " .. attempt .. " | pets=" .. petsState .. " gems=" .. gemsState .. " -> " .. v)
         if v == "sent" then
@@ -5193,7 +5199,7 @@ local function settleUnconfirmedWithdrawalInner(tradeMethod, reason)
             break
         elseif v == "kept" then
             keptReads = keptReads + 1
-            if keptReads >= 8 then
+            if keptReads >= 15 then
                 verdict = "kept"
                 break
             end
@@ -5327,11 +5333,24 @@ local function connectMessage(localId, tradeMethod)
                 pcall(function() tradingMessage.Enabled = false end)
                 return
             end
-            tradeCancelled = true
-            tradeProcessed = true
             -- Read before yielding (2026-11-14 review): after sendMessage the
             -- globals can already belong to the next player's trade.
             local cancelWd = lastWithdrawalData and lastWithdrawalData.data
+            -- Once the bot has pressed confirm the trade may have gone through
+            -- anyway (2026-11-18: 59 "Cancelled by player" refunds in 3 days, all
+            -- without looking). Decide by what actually left the bot instead.
+            if tradeMethod == "withdraw" and cancelWd and botConfirmed then
+                pcall(function() tradingMessage.Enabled = false end)
+                local outcome = settleUnconfirmedWithdrawal(tradeMethod, "Cancelled by player")
+                if outcome == "delivered" or outcome == "busy" or lastGameTradeId ~= localId then return end
+                sendMessage(outcome == "refunded" and "Withdrawal saved - try again!" or "Contact support!")
+                releaseIncomingTradeLock()
+                goNext = true
+                resetTradeState()
+                return
+            end
+            tradeCancelled = true
+            tradeProcessed = true
             sendMessage("Trade cancelled")
             if tradeMethod == "withdraw" and cancelWd then
                 local saved = cancelWithdrawalTrade(cancelWd, "Cancelled by player", true)
