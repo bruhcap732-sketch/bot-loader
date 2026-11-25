@@ -82,18 +82,14 @@ end
 -- Simulator 99! Please wait while we redirect you..." screen for 6 hours,
 -- more than once). When Big Games restarts servers, PS99 teleports everyone
 -- to a new server; if that teleport fails the client waits on the screen
--- forever. If the screen is still up after 2 minutes, join a fresh public
--- PS99 server ourselves, retrying every minute. Volt's auto-execute runs this
--- script again in the new server. It sits at the very top (right after the
--- local player is known): during a restart PS99 moves the client to a
--- waiting place where none of the game's modules exist, so anything later in
--- this file can stall there before the watchdog would ever start.
+-- forever. If the screen is still up after 90 seconds, close this Roblox
+-- window so Volt relaunches it into a fresh server, where Volt's auto-execute
+-- runs this script again. It sits at the very top (right after the local
+-- player is known): during a restart PS99 moves the client to a waiting
+-- place where none of the game's modules exist, so anything later in this
+-- file can stall there before the watchdog would ever start.
 task.spawn(function()
-    local teleportService = game:GetService("TeleportService")
     local RESTART_TEXT = "restarting pet simulator"
-    -- PS99's main place (roblox.com/games/8737899170) - not game.PlaceId,
-    -- in case the restart screen lives in a separate redirect place.
-    local PS99_PLACE_ID = 8737899170
     local seenSince = nil
     local lastTry = 0
     local function hasRestartText(root)
@@ -124,31 +120,44 @@ task.spawn(function()
         if net and not net:FindFirstChildOfClass("ClientReplicator") then return "lost connection" end
         return false
     end
-    print("[WATCHDOG] armed - rejoins PS99 if stuck on a restart / disconnect for 2 minutes")
-    local tries = 0
+    print("[WATCHDOG] armed - closes Roblox if stuck on a restart / disconnect for 90 seconds")
+    -- An "alive" file for bot_server_watchdog.ps1 (outside Roblox): if
+    -- Roblox freezes so hard that no Lua runs at all, this file stops
+    -- changing and the outside watchdog force-closes Roblox. Its own thread,
+    -- touching nothing in the game, so a stalled trade never stops it.
+    task.spawn(function()
+        if type(writefile) ~= "function" then
+            warn("[WATCHDOG] executor has no writefile - the outside watchdog can't see this bot")
+            return
+        end
+        local fileName = "bloxyflip_alive_" .. tostring(localPlayer.Name) .. ".txt"
+        while true do
+            pcall(writefile, fileName, tostring(os.time()))
+            task.wait(20)
+        end
+    end)
+    -- 2026-11-25 (operator: since ~6:30 AM Eastern PS99's restart redirect
+    -- never completes, and rejoining from inside the stuck client doesn't
+    -- help): after 90 seconds stuck, close this Roblox window outright so
+    -- Volt relaunches it into a fresh server. A line every 30s while stuck
+    -- shows in the console that the script is still alive.
     while true do
         task.wait(15)
         local ok, why = pcall(stuck)
         if ok and why then
             seenSince = seenSince or os.clock()
-            if os.clock() - seenSince >= 120 and os.clock() - lastTry >= 60 then
+            local stuckFor = os.clock() - seenSince
+            if os.clock() - lastTry >= 30 then
                 lastTry = os.clock()
-                tries = tries + 1
-                if tries <= 3 then
-                    warn("[WATCHDOG] Stuck (" .. why .. ") - joining a fresh PS99 server, try " .. tries)
-                    pcall(function()
-                        teleportService:Teleport(PS99_PLACE_ID, localPlayer)
-                    end)
-                else
-                    -- Three rejoins did nothing: close this Roblox window so
-                    -- the account manager's relaunch brings it back clean.
-                    warn("[WATCHDOG] Rejoin keeps failing - closing Roblox so it can be relaunched")
-                    pcall(function() game:Shutdown() end)
-                end
+                warn("[WATCHDOG] Stuck (" .. why .. ") for " .. math.floor(stuckFor) .. "s")
+            end
+            if stuckFor >= 90 then
+                warn("[WATCHDOG] Closing Roblox so Volt relaunches it into a fresh server")
+                task.wait(1)
+                pcall(function() game:Shutdown() end)
             end
         else
             seenSince = nil
-            tries = 0
         end
     end
 end)
