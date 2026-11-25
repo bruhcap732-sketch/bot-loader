@@ -5697,6 +5697,52 @@ pcall(function()
 end)
 
 -- ============================================================
+-- STUCK-RESTART WATCHDOG
+-- ============================================================
+-- 2026-11-25 (operator: both bots sat on PS99's "We're restarting Pet
+-- Simulator 99! Please wait while we redirect you..." screen for 6 hours,
+-- more than once). When Big Games restarts servers, PS99 teleports everyone
+-- to a new server; if that teleport fails the client waits on the screen
+-- forever. If the screen is still up after 2 minutes, join a fresh public
+-- PS99 server ourselves, retrying every minute. Volt's auto-execute runs this
+-- script again in the new server.
+task.spawn(function()
+    local teleportService = game:GetService("TeleportService")
+    local RESTART_TEXT = "restarting pet simulator"
+    -- PS99's main place (roblox.com/games/8737899170) - not game.PlaceId,
+    -- in case the restart screen lives in a separate redirect place.
+    local PS99_PLACE_ID = 8737899170
+    local seenSince = nil
+    local lastTry = 0
+    local function restartScreenUp()
+        local gui = localPlayer:FindFirstChildOfClass("PlayerGui")
+        if not gui then return false end
+        for _, d in ipairs(gui:GetDescendants()) do
+            if d:IsA("TextLabel") and d.Visible and string.find(string.lower(d.Text), RESTART_TEXT, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+    while true do
+        task.wait(15)
+        local ok, up = pcall(restartScreenUp)
+        if ok and up then
+            seenSince = seenSince or os.clock()
+            if os.clock() - seenSince >= 120 and os.clock() - lastTry >= 60 then
+                lastTry = os.clock()
+                warn("[WATCHDOG] Stuck on the PS99 restart screen - joining a fresh server")
+                pcall(function()
+                    teleportService:Teleport(PS99_PLACE_ID, localPlayer)
+                end)
+            end
+        else
+            seenSince = nil
+        end
+    end
+end)
+
+-- ============================================================
 -- KEEP-ALIVE
 -- ============================================================
 task.spawn(function()
