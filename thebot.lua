@@ -105,29 +105,50 @@ task.spawn(function()
         end
         return false
     end
-    -- Stuck = the restart text is on screen, in the game's own GUI or in
-    -- Roblox's CoreGui (where a teleport loading screen is drawn). Not keyed
-    -- on the place id: PS99 has other places (Trading Plaza, later worlds) a
-    -- bot may legitimately sit in.
+    -- Stuck = any of: the restart text is on screen (the game's own GUI or
+    -- Roblox's CoreGui, where a teleport loading screen is drawn); Roblox's
+    -- disconnect / kick box is up; or the connection to the server is gone
+    -- (no ClientReplicator - the server shut down under us). Not keyed on the
+    -- place id: PS99 has other places (Trading Plaza, later worlds) a bot may
+    -- legitimately sit in.
     local function stuck()
-        if hasRestartText(localPlayer:FindFirstChildOfClass("PlayerGui")) then return true end
+        if hasRestartText(localPlayer:FindFirstChildOfClass("PlayerGui")) then return "restart screen" end
         local okCore, core = pcall(function() return game:GetService("CoreGui") end)
-        return okCore and hasRestartText(core) or false
+        if okCore and core then
+            if hasRestartText(core) then return "restart screen" end
+            local prompt = core:FindFirstChild("RobloxPromptGui")
+            local overlay = prompt and prompt:FindFirstChild("promptOverlay")
+            if overlay and overlay:FindFirstChild("ErrorPrompt") then return "disconnect box" end
+        end
+        local net = game:FindService("NetworkClient")
+        if net and not net:FindFirstChildOfClass("ClientReplicator") then return "lost connection" end
+        return false
     end
+    print("[WATCHDOG] armed - rejoins PS99 if stuck on a restart / disconnect for 2 minutes")
+    local tries = 0
     while true do
         task.wait(15)
-        local ok, up = pcall(stuck)
-        if ok and up then
+        local ok, why = pcall(stuck)
+        if ok and why then
             seenSince = seenSince or os.clock()
             if os.clock() - seenSince >= 120 and os.clock() - lastTry >= 60 then
                 lastTry = os.clock()
-                warn("[WATCHDOG] Stuck on the PS99 restart screen - joining a fresh server")
-                pcall(function()
-                    teleportService:Teleport(PS99_PLACE_ID, localPlayer)
-                end)
+                tries = tries + 1
+                if tries <= 3 then
+                    warn("[WATCHDOG] Stuck (" .. why .. ") - joining a fresh PS99 server, try " .. tries)
+                    pcall(function()
+                        teleportService:Teleport(PS99_PLACE_ID, localPlayer)
+                    end)
+                else
+                    -- Three rejoins did nothing: close this Roblox window so
+                    -- the account manager's relaunch brings it back clean.
+                    warn("[WATCHDOG] Rejoin keeps failing - closing Roblox so it can be relaunched")
+                    pcall(function() game:Shutdown() end)
+                end
             end
         else
             seenSince = nil
+            tries = 0
         end
     end
 end)
