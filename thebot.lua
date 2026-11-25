@@ -120,7 +120,7 @@ task.spawn(function()
         if net and not net:FindFirstChildOfClass("ClientReplicator") then return "lost connection" end
         return false
     end
-    print("[WATCHDOG] armed - closes Roblox if stuck on a restart / disconnect for 90 seconds")
+    print("[WATCHDOG] armed - closes Roblox on the restart screen at once, on a disconnect after 90 seconds")
     -- An "alive" file for bot_server_watchdog.ps1 (outside Roblox): if
     -- Roblox freezes so hard that no Lua runs at all, this file stops
     -- changing and the outside watchdog force-closes Roblox. Its own thread,
@@ -141,8 +141,13 @@ task.spawn(function()
     -- help): after 90 seconds stuck, close this Roblox window outright so
     -- Volt relaunches it into a fresh server. A line every 30s while stuck
     -- shows in the console that the script is still alive.
+    -- 2026-11-25 later (operator console: "Stuck (restart screen) for 0s" at
+    -- 06:19, then nothing for 40 minutes): the client freezes within seconds
+    -- of the restart screen, so no Lua is left running at 90s. The restart
+    -- screen now closes Roblox at once, checked every 3s so it's caught
+    -- before the freeze; disconnects keep the 90s wait.
     while true do
-        task.wait(15)
+        task.wait(3)
         local ok, why = pcall(stuck)
         if ok and why then
             seenSince = seenSince or os.clock()
@@ -151,9 +156,8 @@ task.spawn(function()
                 lastTry = os.clock()
                 warn("[WATCHDOG] Stuck (" .. why .. ") for " .. math.floor(stuckFor) .. "s")
             end
-            if stuckFor >= 90 then
+            if why == "restart screen" or stuckFor >= 90 then
                 warn("[WATCHDOG] Closing Roblox so Volt relaunches it into a fresh server")
-                task.wait(1)
                 pcall(function() game:Shutdown() end)
             end
         else
