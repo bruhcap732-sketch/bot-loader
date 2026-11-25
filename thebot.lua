@@ -120,10 +120,10 @@ task.spawn(function()
         if net and not net:FindFirstChildOfClass("ClientReplicator") then return "lost connection" end
         return false
     end
-    print("[WATCHDOG] armed - closes Roblox on the restart screen at once, on a disconnect after 90 seconds")
-    -- An "alive" file for bot_server_watchdog.ps1 (outside Roblox): if
+    print("[WATCHDOG] armed - asks BFClose to close Roblox if stuck on a restart / disconnect for 90 seconds")
+    -- An "alive" file for the BFClose scheduled task (outside Roblox): if
     -- Roblox freezes so hard that no Lua runs at all, this file stops
-    -- changing and the outside watchdog force-closes Roblox. Its own thread,
+    -- changing and BFClose force-closes Roblox. Its own thread,
     -- touching nothing in the game, so a stalled trade never stops it.
     task.spawn(function()
         if type(writefile) ~= "function" then
@@ -141,13 +141,16 @@ task.spawn(function()
     -- help): after 90 seconds stuck, close this Roblox window outright so
     -- Volt relaunches it into a fresh server. A line every 30s while stuck
     -- shows in the console that the script is still alive.
-    -- 2026-11-25 later (operator console: "Stuck (restart screen) for 0s" at
-    -- 06:19, then nothing for 40 minutes): the client freezes within seconds
-    -- of the restart screen, so no Lua is left running at 90s. The restart
-    -- screen now closes Roblox at once, checked every 3s so it's caught
-    -- before the freeze; disconnects keep the 90s wait.
+    -- 2026-11-25 later: game:Shutdown() only leaves PS99 - the Roblox app
+    -- stays open on its home page and Volt relaunches only when the whole
+    -- app exits - and the Roblox logs showed most restart screens are
+    -- migrations that DO arrive ("WasMigrated = true" ~8s later), so leaving
+    -- at once threw bots out of working moves. Now: after 90s still stuck,
+    -- write bloxyflip_close_<name>.txt for the BFClose scheduled task on the
+    -- bot server, which ends the whole app. If the client freezes instead,
+    -- the alive file above stops changing and BFClose closes it from that.
     while true do
-        task.wait(3)
+        task.wait(15)
         local ok, why = pcall(stuck)
         if ok and why then
             seenSince = seenSince or os.clock()
@@ -156,16 +159,9 @@ task.spawn(function()
                 lastTry = os.clock()
                 warn("[WATCHDOG] Stuck (" .. why .. ") for " .. math.floor(stuckFor) .. "s")
             end
-            if why == "restart screen" or stuckFor >= 90 then
-                warn("[WATCHDOG] Closing Roblox so Volt relaunches it into a fresh server")
-                -- Shutdown only leaves PS99 - the Roblox app stays open on
-                -- its home page and Volt relaunches only when the whole app
-                -- exits (operator, 2026-11-25). This file asks the
-                -- BloxyFlipCloseRoblox scheduled task to end the app.
-                if type(writefile) == "function" then
-                    pcall(writefile, "bloxyflip_close_" .. tostring(localPlayer.Name) .. ".txt", tostring(os.time()))
-                end
-                pcall(function() game:Shutdown() end)
+            if stuckFor >= 90 and type(writefile) == "function" then
+                warn("[WATCHDOG] Asking BFClose to close Roblox so Volt relaunches it")
+                pcall(writefile, "bloxyflip_close_" .. tostring(localPlayer.Name) .. ".txt", tostring(os.time()))
             end
         else
             seenSince = nil
