@@ -158,6 +158,13 @@ task.spawn(function()
             end
             if why == "restart screen" or stuckFor >= 90 then
                 warn("[WATCHDOG] Closing Roblox so Volt relaunches it into a fresh server")
+                -- Shutdown only leaves PS99 - the Roblox app stays open on
+                -- its home page and Volt relaunches only when the whole app
+                -- exits (operator, 2026-11-25). This file asks the
+                -- BloxyFlipCloseRoblox scheduled task to end the app.
+                if type(writefile) == "function" then
+                    pcall(writefile, "bloxyflip_close_" .. tostring(localPlayer.Name) .. ".txt", tostring(os.time()))
+                end
                 pcall(function() game:Shutdown() end)
             end
         else
