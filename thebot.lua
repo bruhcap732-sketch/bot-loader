@@ -35,6 +35,10 @@ local BOT_CREDENTIALS_BY_USERNAME = {
         id = "ab4784d6ea2eb12d8f3db87e",
         secret = "72a6842789af44122feed34a7dcd283e600c46464e8d7f54be88957387b09078",
     },
+    ["Burger_flip1"] = {
+        id = "ee938ab95a4c61efa28ace89",
+        secret = "38ad6d3c8a36a2e3d3837f0553298f018797867297cc63cfc2534506a6c854e2",
+    },
 }
 
 -- Hard-errors instead of silently running with blank/wrong credentials -
